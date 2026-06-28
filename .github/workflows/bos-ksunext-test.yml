@@ -16,9 +16,13 @@ on:
         required: true
         default: '13.0'
       defconfig:
-        description: 'defconfig'
+        description: 'defconfig path (di kernel source)'
         required: true
         default: 'vendor/xiaomi/mi845_defconfig'
+      use_extracted_config:
+        description: 'Pakai config hasil extract boot.img asli sebagai basis? (true/false)'
+        required: true
+        default: 'true'
       ksu_tag:
         description: 'KernelSU-Next tag/commit'
         required: false
@@ -33,11 +37,15 @@ jobs:
     name: ${{ github.event.inputs.zip_name }}
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repo (untuk akses extracted-config/my_defconfig.txt)
+        uses: actions/checkout@v4
+
       - name: Show Input
         run: |
           echo "kernel_source: ${{ github.event.inputs.kernel_source }}"
           echo "kernel_branch: ${{ github.event.inputs.kernel_branch }}"
           echo "defconfig: ${{ github.event.inputs.defconfig }}"
+          echo "use_extracted_config: ${{ github.event.inputs.use_extracted_config }}"
           echo "ksu_tag: ${{ github.event.inputs.ksu_tag }}"
 
       - name: Install Build Dependencies
@@ -88,20 +96,42 @@ jobs:
           echo "== Cek entri Kconfig =="
           grep -n "kernelsu" drivers/Kconfig || echo "TIDAK ADA entri di drivers/Kconfig!"
 
-          # Tambahkan CONFIG_KSU=y ke defconfig
           DEFCONFIG_PATH="arch/arm64/configs/${{ github.event.inputs.defconfig }}"
-          if [ -f "$DEFCONFIG_PATH" ]; then
-            echo "CONFIG_KSU=y" >> "$DEFCONFIG_PATH"
-            echo "CONFIG_KPROBES=y" >> "$DEFCONFIG_PATH"
-            echo "CONFIG_HAVE_KPROBES=y" >> "$DEFCONFIG_PATH"
-            echo "CONFIG_KPROBE_EVENTS=y" >> "$DEFCONFIG_PATH"
-            echo "Defconfig $DEFCONFIG_PATH berhasil dipatch."
-          else
+
+          if [ ! -f "$DEFCONFIG_PATH" ]; then
             echo "ERROR: defconfig tidak ditemukan di $DEFCONFIG_PATH"
             echo "Mencari kemungkinan path defconfig lain:"
             find arch/arm64/configs -iname "*845*" -o -iname "*beryllium*" -o -iname "*xiaomi*" 2>/dev/null
             exit 1
           fi
+
+          # Jika diaktifkan, GANTI isi defconfig source dengan config yang diekstrak
+          # langsung dari boot.img resmi BaikalOS (extract-ikconfig). Ini menjamin base
+          # config 100% identik dengan yang sudah terbukti bisa boot di HP, termasuk
+          # semua flag CONFIG_MACH_XIAOMI_* dan opsi board-specific lain yang mungkin
+          # tidak otomatis terisi sama oleh proses 'make defconfig && make olddefconfig'
+          # dari defconfig mentah di source.
+          if [ "${{ github.event.inputs.use_extracted_config }}" = "true" ]; then
+            EXTRACTED_CFG="$GITHUB_WORKSPACE/extracted-config/my_defconfig.txt"
+            if [ -f "$EXTRACTED_CFG" ]; then
+              echo "[INFO] Memakai config hasil extract boot.img asli sebagai basis (menimpa $DEFCONFIG_PATH)."
+              cp "$EXTRACTED_CFG" "$DEFCONFIG_PATH"
+            else
+              echo "[PERINGATAN] use_extracted_config=true tapi file $EXTRACTED_CFG tidak ditemukan di repo."
+              echo "Pastikan kamu sudah commit file extracted config ke path 'extracted-config/my_defconfig.txt' di repo ini."
+              echo "Lanjut pakai defconfig asli dari source kernel sebagai fallback."
+            fi
+          fi
+
+          # Tambahkan config KSU (idempotent: defconfig kernel mengabaikan duplikat,
+          # baris terakhir untuk key yang sama akan dipakai oleh olddefconfig)
+          {
+            echo "CONFIG_KSU=y"
+            echo "CONFIG_KPROBES=y"
+            echo "CONFIG_HAVE_KPROBES=y"
+            echo "CONFIG_KPROBE_EVENTS=y"
+          } >> "$DEFCONFIG_PATH"
+          echo "Defconfig $DEFCONFIG_PATH berhasil dipatch dengan opsi KSU."
 
       - name: Patch arch/arm64/Makefile (fix clang vdso32 "-EL" assembler error)
         run: |
