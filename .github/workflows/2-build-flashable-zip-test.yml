@@ -3,11 +3,15 @@ name: 2. Build Flashable ZIP - AnyKernel3 (BOS Beryllium + KSU-Next + Log)
 on:
   workflow_dispatch:
     inputs:
-      image_gz_dtb_url:
-        description: 'URL langsung ke Image.gz-dtb (artifact GitHub Actions / link lain yang bisa diunduh langsung)'
+      compile_run_id:
+        description: 'Run ID workflow "1. Compile Kernel" yang sukses (lihat di URL halaman run, angka setelah /runs/)'
         required: true
+      compile_artifact_prefix:
+        description: 'Nilai "Nama Build" (zip_name) yang dipakai SAAT MENJALANKAN workflow 1 kemarin (untuk cari nama artifact "<nilai>-gz-dtb")'
+        required: true
+        default: 'bos-beryllium-ksunext'
       zip_name:
-        description: 'Nama Build'
+        description: 'Nama Build untuk ZIP hasil keluaran workflow ini'
         required: true
         default: 'bos-beryllium-ksunext'
       kernel_string:
@@ -19,6 +23,10 @@ on:
         required: false
         default: 'https://github.com/ThRE-Team/KernelSU-Next/releases'
 
+permissions:
+  actions: read
+  contents: read
+
 jobs:
   build-flashable-zip:
     name: ${{ github.event.inputs.zip_name }}-flashable
@@ -27,40 +35,42 @@ jobs:
       - name: Checkout repo (untuk akses build-metadata.json jika ada)
         uses: actions/checkout@v4
 
-      - name: Download Image.gz-dtb
-        run: |
-          curl -L --fail -o Image.gz-dtb "${{ github.event.inputs.image_gz_dtb_url }}"
-          echo "== Info file yang diunduh =="
-          file Image.gz-dtb
-          ls -la Image.gz-dtb
+      - name: Download artifact Image.gz-dtb dari run workflow 1
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ github.event.inputs.compile_artifact_prefix }}-gz-dtb
+          run-id: ${{ github.event.inputs.compile_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: downloaded-artifact
 
-          # Jika hasil download ternyata ZIP (kasus umum: link artifact GitHub Actions
-          # mengunduh dalam bentuk .zip pembungkus, bukan file mentahnya langsung),
-          # otomatis ekstrak supaya tetap mendapat Image.gz-dtb yang sebenarnya.
-          if file Image.gz-dtb | grep -qi "zip archive"; then
-            echo "[INFO] File hasil download adalah ZIP, mengekstrak isinya..."
-            mv Image.gz-dtb downloaded.zip
-            unzip -o downloaded.zip -d extracted-download
-            find extracted-download -iname "Image.gz-dtb" -exec cp {} Image.gz-dtb \;
-            if [ ! -f Image.gz-dtb ]; then
-              echo "ERROR: Tidak menemukan Image.gz-dtb di dalam ZIP yang diunduh."
-              find extracted-download -type f
-              exit 1
-            fi
+      - name: Download artifact build-metadata dari run workflow 1 (opsional)
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: build-metadata
+          run-id: ${{ github.event.inputs.compile_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: downloaded-metadata
+
+      - name: Susun Image.gz-dtb & build-metadata.json di root workspace
+        run: |
+          find downloaded-artifact -iname "Image.gz-dtb" -exec cp {} Image.gz-dtb \;
+          if [ ! -f Image.gz-dtb ]; then
+            echo "ERROR: Image.gz-dtb tidak ditemukan di artifact yang diunduh."
+            echo "Isi folder downloaded-artifact:"
+            find downloaded-artifact -type f
+            exit 1
           fi
-
-          echo "== Validasi akhir =="
+          echo "== Image.gz-dtb ditemukan =="
           file Image.gz-dtb
           ls -la Image.gz-dtb
 
-      - name: Coba baca build-metadata.json (opsional, jika ada di repo)
-        run: |
-          if [ -f "build-metadata.json" ]; then
-            echo "[INFO] build-metadata.json ditemukan di root repo, dipakai untuk changelog."
+          if [ -f downloaded-metadata/build-metadata.json ]; then
+            cp downloaded-metadata/build-metadata.json build-metadata.json
+            echo "== build-metadata.json ditemukan =="
             cat build-metadata.json
           else
-            echo "[INFO] build-metadata.json tidak ada di repo. Changelog akan dibuat minim (tanpa detail commit kernel/KSU)."
-            echo "Tips: download artifact 'build-metadata' dari run workflow compile, lalu commit ke root repo ini sebagai 'build-metadata.json' supaya changelog lebih lengkap."
+            echo "[INFO] build-metadata.json tidak ditemukan di run tersebut. Changelog akan dibuat minim."
           fi
 
       - name: Build AnyKernel3 Flashable ZIP (template resmi osm0sis, selalu up-to-date)
@@ -86,7 +96,7 @@ jobs:
           with open("anykernel.sh", "r") as f:
               content = f.read()
 
-          kernel_string = os.environ.get("KERNEL_STRING_ENV", "BaikalOS Beryllium KernelSU-Next Kernel")
+          kernel_string = os.environ.get("KERNEL_STRING_ENV", "BOS Beryllium KernelSU-Next Kernel")
 
           # 1) Ganti blok properties() dengan properti khusus beryllium.
           new_properties = f"""properties() {{ '
@@ -193,7 +203,7 @@ jobs:
           | Kernel release string | \`${KERNEL_VERSION_STRING}\` |
           | Clang | ${CLANG_URL} |
           | AnyKernel3 | Template resmi terbaru dari osm0sis/AnyKernel3 |
-          | Image.gz-dtb sumber | ${{ github.event.inputs.image_gz_dtb_url }} |
+          | Image.gz-dtb sumber | Run ID workflow compile #${{ github.event.inputs.compile_run_id }} (${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.event.inputs.compile_run_id }}) |
 
           ## Manager APK
           ${{ github.event.inputs.manager_apk_url }}
