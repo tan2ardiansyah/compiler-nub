@@ -53,12 +53,23 @@ jobs:
           echo "== Cek lokasi arm-linux-gnueabi-as =="
           which arm-linux-gnueabi-as || echo "TIDAK DITEMUKAN"
 
+      - name: Setup Clang Cache
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/clang-ext
+          key: clang-${{ github.event.inputs.clang_url }}
+
       - name: Setup Clang
+        if: steps.clang-cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p ~/clang-ext
           curl -Lo clang.tar.gz "${{ github.event.inputs.clang_url }}"
           tar -xzf clang.tar.gz -C ~/clang-ext
-          echo "$HOME/clang-ext/bin" >> $GITHUB_PATH
+          rm -f clang.tar.gz
+
+      - name: Add Clang to PATH
+        run: echo "$HOME/clang-ext/bin" >> $GITHUB_PATH
 
       - name: Clone Kernel Source (BaikalOS)
         run: |
@@ -92,42 +103,43 @@ jobs:
             exit 1
           fi
 
-      - name: Patch vdso32 Makefile (fix clang "-EL" assembler error)
+      - name: Patch arch/arm64/Makefile (fix clang vdso32 "-EL" assembler error)
         run: |
           cd kernel-src
-          VDSO32_MK="arch/arm64/kernel/vdso32/Makefile"
+          MAIN_MK="arch/arm64/Makefile"
 
-          if [ ! -f "$VDSO32_MK" ]; then
-            echo "PERINGATAN: $VDSO32_MK tidak ditemukan, skip patch ini."
-            echo "Mencari file vdso32 lain:"
-            find arch/arm64 -ipath "*vdso32*" -name "Makefile*" 2>/dev/null
-            exit 0
+          if [ ! -f "$MAIN_MK" ]; then
+            echo "ERROR: $MAIN_MK tidak ditemukan!"
+            exit 1
           fi
 
-          echo "=================================================="
-          echo "ISI LENGKAP $VDSO32_MK (untuk debug)"
-          echo "=================================================="
-          cat -A "$VDSO32_MK" | head -100
-          echo "=================================================="
+          echo "== Cari blok CLANG_PREFIX32 / GCC_TOOLCHAIN32 di $MAIN_MK =="
+          grep -n "CLANG_PREFIX32\|GCC_TOOLCHAIN32\|CLANG_TARGET_ARM32\|CLANG_GCC32_TC" "$MAIN_MK" || echo "TIDAK DITEMUKAN sama sekali!"
 
-          cp "$VDSO32_MK" "$VDSO32_MK.orig"
+          cp "$MAIN_MK" "$MAIN_MK.orig"
 
-          # Strategi 1: Pattern resmi upstream (clang flags pakai nama variabel umum)
-          # Coba beberapa nama variabel yang umum dipakai di berbagai versi kernel:
-          # CC_COMPAT_CLANG_FLAGS, cc32-as, VDSO_CAFLAGS, dst.
+          # Fix resmi: arm64: vdso32: Fix '--prefix=' value for newer versions of clang
+          # https://github.com/ClangBuiltLinux/linux/issues/1099
+          # CLANG_PREFIX32 harus menyertakan nama prefix CROSS_COMPILE_ARM32, bukan cuma direktorinya.
+          # Pattern asli biasanya:
+          #   export CLANG_PREFIX32 := --prefix=$(GCC_TOOLCHAIN32_DIR)
+          # diubah jadi:
+          #   export CLANG_PREFIX32 := --prefix=$(GCC_TOOLCHAIN32_DIR)$(notdir $(CROSS_COMPILE_ARM32))
           sed -i -E \
-            's@(--prefix=\$\(COMPAT_GCC_TOOLCHAIN_DIR\))[[:space:]]*$@\1$(notdir $(CROSS_COMPILE_COMPAT))@' \
-            "$VDSO32_MK"
+            's@(CLANG_PREFIX32[[:space:]]*:=[[:space:]]*--prefix=\$\(GCC_TOOLCHAIN32_DIR\))[[:space:]]*$@\1$(notdir $(CROSS_COMPILE_ARM32))@' \
+            "$MAIN_MK"
 
-          if ! diff -q "$VDSO32_MK" "$VDSO32_MK.orig" > /dev/null; then
-            echo "[OK] Strategi 1 (pattern resmi --prefix=) berhasil mengubah file."
+          if ! diff -q "$MAIN_MK" "$MAIN_MK.orig" > /dev/null; then
+            echo "[OK] Patch CLANG_PREFIX32 berhasil diterapkan."
+            echo "== Baris setelah patch =="
+            grep -n "CLANG_PREFIX32" "$MAIN_MK"
           else
-            echo "[INFO] Strategi 1 tidak match. File tidak memakai variabel CC_COMPAT_CLANG_FLAGS/--prefix standar."
-            echo "[INFO] Kemungkinan kernel ini memakai cara lama: CROSS_COMPILE langsung sebagai 'as' tanpa clang -target."
-            echo "[INFO] Tidak melakukan patch otomatis; akan diatasi lewat AS_ARM32 fallback di step Compile."
+            echo "[PERINGATAN] Pattern CLANG_PREFIX32 tidak match/tidak berubah."
+            echo "Menampilkan 15 baris di sekitar definisi CLANG_PREFIX32 untuk diperiksa manual:"
+            grep -n -B5 -A10 "CLANG_TARGET_ARM32\|CLANG_PREFIX32" "$MAIN_MK" || true
           fi
 
-          rm -f "$VDSO32_MK.orig"
+          rm -f "$MAIN_MK.orig"
 
       - name: Compile Kernel (test build, tidak untuk flash)
         env:
