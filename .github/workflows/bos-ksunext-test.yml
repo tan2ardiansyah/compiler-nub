@@ -6,7 +6,7 @@ on:
       zip_name:
         description: 'Nama Build'
         required: true
-        default: 'bos-beryllium-ksunext'
+        default: 'baikalos-beryllium-ksunext'
       kernel_source:
         description: 'Kernel Source'
         required: true
@@ -87,6 +87,36 @@ jobs:
             echo "Mencari kemungkinan path defconfig lain:"
             find arch/arm64/configs -iname "*845*" -o -iname "*beryllium*" -o -iname "*xiaomi*" 2>/dev/null
             exit 1
+          fi
+
+      - name: Patch vdso32 Makefile (fix clang "-EL" assembler error)
+        run: |
+          cd kernel-src
+          VDSO32_MK="arch/arm64/kernel/vdso32/Makefile"
+          if [ -f "$VDSO32_MK" ]; then
+            echo "== Isi baris --prefix SEBELUM patch =="
+            grep -n "prefix=" "$VDSO32_MK" || echo "(baris --prefix tidak ditemukan, mungkin sudah beda format)"
+
+            # Fix resmi upstream: "arm64: vdso32: Fix --prefix= value for newer versions of clang"
+            # https://github.com/ClangBuiltLinux/linux/issues/1099
+            # Hanya menambahkan $(notdir $(CROSS_COMPILE_COMPAT)) ke akhir baris --prefix=...COMPAT_GCC_TOOLCHAIN_DIR)
+            # jika belum ada (idempotent, aman dijalankan walau formatnya sedikit berbeda).
+            sed -i -E \
+              's@(--prefix=\$\(COMPAT_GCC_TOOLCHAIN_DIR\))[[:space:]]*$@\1$(notdir $(CROSS_COMPILE_COMPAT))@' \
+              "$VDSO32_MK"
+
+            echo "== Isi baris --prefix SETELAH patch =="
+            grep -n "prefix=" "$VDSO32_MK" || echo "(masih tidak ditemukan)"
+
+            if grep -q 'prefix=\$(COMPAT_GCC_TOOLCHAIN_DIR)\$(notdir \$(CROSS_COMPILE_COMPAT))' "$VDSO32_MK"; then
+              echo "[OK] Patch vdso32 berhasil diterapkan."
+            else
+              echo "[PERINGATAN] Pattern tidak ditemukan/tidak berubah. Compile mungkin masih akan gagal di tahap vdso32."
+              echo "Isi lengkap baris terkait toolchain untuk inspeksi manual:"
+              grep -n -A2 -B2 "COMPAT_GCC_TOOLCHAIN" "$VDSO32_MK" || true
+            fi
+          else
+            echo "PERINGATAN: $VDSO32_MK tidak ditemukan, skip patch ini."
           fi
 
       - name: Compile Kernel (test build, tidak untuk flash)
