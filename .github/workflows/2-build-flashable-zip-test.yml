@@ -18,10 +18,14 @@ on:
         description: 'kernel.string yang ditampilkan di AnyKernel3 (info build, mis. versi kernel + KSU)'
         required: false
         default: 'BOS Beryllium KernelSU-Next Kernel'
-      manager_apk_url:
-        description: 'URL rilis manager APK KSU-Next yang dipakai (untuk dicatat di changelog)'
-        required: false
-        default: 'https://github.com/ThRE-Team/KernelSU-Next/releases'
+      manager_apk_source:
+        description: 'Repo sumber manager APK KSU-Next (URL rilis akan disusun otomatis dari ksu_tag hasil compile)'
+        required: true
+        default: 'https://github.com/ThRE-Team/KernelSU-Next'
+        type: choice
+        options:
+          - 'https://github.com/ThRE-Team/KernelSU-Next'
+          - 'https://github.com/KernelSU-Next/KernelSU-Next'
 
 permissions:
   actions: read
@@ -72,6 +76,39 @@ jobs:
           else
             echo "[INFO] build-metadata.json tidak ditemukan di run tersebut. Changelog akan dibuat minim."
           fi
+
+      - name: Susun & Verifikasi URL Manager APK (otomatis dari ksu_tag)
+        run: |
+          if [ -f "build-metadata.json" ]; then
+            KSU_TAG=$(python3 -c "import json; print(json.load(open('build-metadata.json')).get('ksu_tag','unknown'))")
+          else
+            KSU_TAG="unknown"
+          fi
+
+          MANAGER_SOURCE="${{ github.event.inputs.manager_apk_source }}"
+          echo "KSU_TAG dari build-metadata.json: $KSU_TAG"
+          echo "Sumber manager dipilih: $MANAGER_SOURCE"
+
+          if [ "$KSU_TAG" = "unknown" ]; then
+            MANAGER_RELEASE_URL="${MANAGER_SOURCE}/releases"
+            MANAGER_STATUS="[PERINGATAN] KSU_TAG tidak diketahui (build-metadata.json tidak ada/tidak lengkap). Menautkan ke halaman releases umum, BUKAN ke rilis spesifik. Cek manual versi yang sesuai."
+          else
+            MANAGER_RELEASE_URL="${MANAGER_SOURCE}/releases/tag/${KSU_TAG}"
+            # Verifikasi URL ini benar-benar ada (bukan 404) sebelum dipakai di changelog.
+            HTTP_STATUS=$(curl -o /dev/null -s -w "%{http_code}" -L "$MANAGER_RELEASE_URL")
+            echo "HTTP status untuk $MANAGER_RELEASE_URL : $HTTP_STATUS"
+            if [ "$HTTP_STATUS" = "200" ]; then
+              MANAGER_STATUS="[OK] Rilis manager APK untuk tag ${KSU_TAG} ditemukan di sumber ini."
+            else
+              MANAGER_STATUS="[PERINGATAN] Tidak menemukan rilis tag ${KSU_TAG} di ${MANAGER_SOURCE} (HTTP ${HTTP_STATUS}). Kemungkinan repo ini belum/tidak merilis tag tersebut. Fallback ke halaman releases umum."
+              MANAGER_RELEASE_URL="${MANAGER_SOURCE}/releases"
+            fi
+          fi
+
+          echo "MANAGER_RELEASE_URL=$MANAGER_RELEASE_URL" >> "$GITHUB_ENV"
+          echo "MANAGER_STATUS=$MANAGER_STATUS" >> "$GITHUB_ENV"
+          echo "$MANAGER_STATUS"
+          echo "URL final: $MANAGER_RELEASE_URL"
 
       - name: Build AnyKernel3 Flashable ZIP (template resmi osm0sis, selalu up-to-date)
         run: |
@@ -206,9 +243,12 @@ jobs:
           | Image.gz-dtb sumber | Run ID workflow compile #${{ github.event.inputs.compile_run_id }} (${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.event.inputs.compile_run_id }}) |
 
           ## Manager APK
-          ${{ github.event.inputs.manager_apk_url }}
+          ${MANAGER_STATUS}
 
-          Pastikan build number manager APK sama/lebih tinggi dari minimum yang disyaratkan rilis tersebut.
+          Unduh manager APK yang sesuai versi kernel ini di:
+          ${MANAGER_RELEASE_URL}
+
+          Pastikan build number manager APK sama/lebih tinggi dari minimum yang disyaratkan rilis tersebut, dan **jangan campur** manager dari tag berbeda dengan kernel yang sedang dipakai.
 
           ## File
           - \`${ZIP_FILENAME}\` — flashable ZIP (AnyKernel3), siap di-flash lewat TWRP/recovery
