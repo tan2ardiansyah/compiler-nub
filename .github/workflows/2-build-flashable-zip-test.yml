@@ -1,0 +1,228 @@
+name: 2. Build Flashable ZIP - AnyKernel3 (BOS Beryllium + KSU-Next + Log)
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_gz_dtb_url:
+        description: 'URL langsung ke Image.gz-dtb (artifact GitHub Actions / link lain yang bisa diunduh langsung)'
+        required: true
+      zip_name:
+        description: 'Nama Build'
+        required: true
+        default: 'bos-beryllium-ksunext'
+      kernel_string:
+        description: 'kernel.string yang ditampilkan di AnyKernel3 (info build, mis. versi kernel + KSU)'
+        required: false
+        default: 'BOS Beryllium KernelSU-Next Kernel'
+      manager_apk_url:
+        description: 'URL rilis manager APK KSU-Next yang dipakai (untuk dicatat di changelog)'
+        required: false
+        default: 'https://github.com/ThRE-Team/KernelSU-Next/releases'
+
+jobs:
+  build-flashable-zip:
+    name: ${{ github.event.inputs.zip_name }}-flashable
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo (untuk akses build-metadata.json jika ada)
+        uses: actions/checkout@v4
+
+      - name: Download Image.gz-dtb
+        run: |
+          curl -L --fail -o Image.gz-dtb "${{ github.event.inputs.image_gz_dtb_url }}"
+          echo "== Info file yang diunduh =="
+          file Image.gz-dtb
+          ls -la Image.gz-dtb
+
+          # Jika hasil download ternyata ZIP (kasus umum: link artifact GitHub Actions
+          # mengunduh dalam bentuk .zip pembungkus, bukan file mentahnya langsung),
+          # otomatis ekstrak supaya tetap mendapat Image.gz-dtb yang sebenarnya.
+          if file Image.gz-dtb | grep -qi "zip archive"; then
+            echo "[INFO] File hasil download adalah ZIP, mengekstrak isinya..."
+            mv Image.gz-dtb downloaded.zip
+            unzip -o downloaded.zip -d extracted-download
+            find extracted-download -iname "Image.gz-dtb" -exec cp {} Image.gz-dtb \;
+            if [ ! -f Image.gz-dtb ]; then
+              echo "ERROR: Tidak menemukan Image.gz-dtb di dalam ZIP yang diunduh."
+              find extracted-download -type f
+              exit 1
+            fi
+          fi
+
+          echo "== Validasi akhir =="
+          file Image.gz-dtb
+          ls -la Image.gz-dtb
+
+      - name: Coba baca build-metadata.json (opsional, jika ada di repo)
+        run: |
+          if [ -f "build-metadata.json" ]; then
+            echo "[INFO] build-metadata.json ditemukan di root repo, dipakai untuk changelog."
+            cat build-metadata.json
+          else
+            echo "[INFO] build-metadata.json tidak ada di repo. Changelog akan dibuat minim (tanpa detail commit kernel/KSU)."
+            echo "Tips: download artifact 'build-metadata' dari run workflow compile, lalu commit ke root repo ini sebagai 'build-metadata.json' supaya changelog lebih lengkap."
+          fi
+
+      - name: Build AnyKernel3 Flashable ZIP (template resmi osm0sis, selalu up-to-date)
+        run: |
+          # Selalu clone AnyKernel3 RESMI terbaru dari osm0sis, supaya tools/ak3-core.sh,
+          # update-binary, dan anykernel.sh template selalu mengikuti versi upstream terbaru.
+          # anykernel.sh DIPAKAI APA ADANYA dari upstream, lalu dipatch presisi (bukan ditulis ulang)
+          # supaya struktur boot_attributes(), blok contoh init_boot/vendor_boot, dst tetap identik
+          # dengan upstream dan otomatis ikut update jika osm0sis mengubah formatnya nanti.
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3-build
+          cd ak3-build
+
+          # Hapus contoh ramdisk/patch milik device referensi (maguro/tuna) bawaan template,
+          # supaya tidak ada modifikasi ramdisk asing yang ikut diterapkan ke ROM lain.
+          rm -rf ramdisk patch vendor_ramdisk vendor_patch README.md version 2>/dev/null || true
+
+          KERNEL_STRING="${{ github.event.inputs.kernel_string }}"
+
+          python3 << PYEOF
+          import re
+          import os
+
+          with open("anykernel.sh", "r") as f:
+              content = f.read()
+
+          kernel_string = os.environ.get("KERNEL_STRING_ENV", "BaikalOS Beryllium KernelSU-Next Kernel")
+
+          # 1) Ganti blok properties() dengan properti khusus beryllium.
+          new_properties = f"""properties() {{ '
+          kernel.string={kernel_string}
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=beryllium
+          device.name2=PocophoneF1
+          device.name3=PocoF1
+          device.name4=
+          device.name5=
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }} # end properties"""
+
+          content, n = re.subn(
+              r"properties\(\)\s*\{.*?\}\s*#\s*end properties",
+              new_properties,
+              content,
+              count=1,
+              flags=re.DOTALL,
+          )
+          print(f"[INFO] Blok properties() diganti: {n} kali")
+
+          # 2) Hapus blok contoh modifikasi ramdisk khusus Galaxy Nexus (init.rc, init.tuna.rc,
+          #    fstab.tuna). Kernel BaikalOS beryllium terbukti TIDAK butuh patch ramdisk tambahan.
+          tuna_block_pattern = re.compile(
+              r"# init\.rc\n.*?append_file fstab\.tuna \"usbdisk\" fstab;\n\n",
+              re.DOTALL,
+          )
+          content, n2 = tuna_block_pattern.subn("", content)
+          print(f"[INFO] Blok contoh ramdisk Galaxy Nexus dihapus: {n2} kali")
+
+          if n == 0:
+              print("[PERINGATAN] Pattern properties() tidak ditemukan/tidak diganti! Cek format anykernel.sh upstream terbaru.")
+          if n2 == 0:
+              print("[PERINGATAN] Blok contoh ramdisk Galaxy Nexus tidak ditemukan. Mungkin upstream sudah ubah formatnya.")
+
+          with open("anykernel.sh", "w") as f:
+              f.write(content)
+          PYEOF
+        env:
+          KERNEL_STRING_ENV: ${{ github.event.inputs.kernel_string }}
+
+      - name: Tampilkan anykernel.sh final & masukkan Image.gz-dtb
+        run: |
+          cd ak3-build
+          echo "== Isi anykernel.sh final =="
+          cat anykernel.sh
+
+          cp ../Image.gz-dtb .
+
+          ZIP_FILENAME="${{ github.event.inputs.zip_name }}-$(date -u +%Y%m%d).zip"
+          echo "ZIP_FILENAME=$ZIP_FILENAME" >> "$GITHUB_ENV"
+
+          zip -r9 "../$ZIP_FILENAME" . -x .git README.md '*placeholder*'
+          cd ..
+          echo "== Isi zip yang dihasilkan =="
+          unzip -l "$ZIP_FILENAME"
+
+      - name: Generate Changelog Otomatis
+        run: |
+          # Ambil metadata dari build-metadata.json jika ada, fallback ke "unknown" jika tidak.
+          if [ -f "build-metadata.json" ]; then
+            KERNEL_SOURCE=$(python3 -c "import json; print(json.load(open('build-metadata.json')).get('kernel_source','unknown'))")
+            KERNEL_BRANCH=$(python3 -c "import json; print(json.load(open('build-metadata.json')).get('kernel_branch','unknown'))")
+            KERNEL_COMMIT=$(python3 -c "import json; print(json.load(open('build-metadata.json')).get('kernel_commit','unknown'))")
+            KSU_TAG=$(python3 -c "import json; print(json.load(open('build-metadata.json')).get('ksu_tag','unknown'))")
+            KSU_COMMIT=$(python3 -c "import json; print(json.load(open('build-metadata.json')).get('ksu_commit','unknown'))")
+            KERNEL_VERSION_STRING=$(python3 -c "import json; print(json.load(open('build-metadata.json')).get('kernel_version_string','unknown'))")
+            CLANG_URL=$(python3 -c "import json; print(json.load(open('build-metadata.json')).get('clang_url','unknown'))")
+            BUILD_DATE_SRC=$(python3 -c "import json; print(json.load(open('build-metadata.json')).get('build_date','unknown'))")
+          else
+            KERNEL_SOURCE="unknown (build-metadata.json tidak ditemukan)"
+            KERNEL_BRANCH="unknown"
+            KERNEL_COMMIT="unknown"
+            KSU_TAG="unknown"
+            KSU_COMMIT="unknown"
+            KERNEL_VERSION_STRING="unknown"
+            CLANG_URL="unknown"
+            BUILD_DATE_SRC="unknown"
+          fi
+
+          ZIP_DATE=$(date -u '+%Y-%m-%d %H:%M UTC')
+
+          cat > CHANGELOG.md << EOF
+          # Changelog — BOS Beryllium + KernelSU-Next (Flashable ZIP)
+
+          **Tanggal compile kernel:** ${BUILD_DATE_SRC}
+          **Tanggal pembuatan ZIP ini:** ${ZIP_DATE}
+
+          ## Sumber
+          | Komponen | Nilai |
+          |---|---|
+          | Kernel source | ${KERNEL_SOURCE} |
+          | Kernel branch | ${KERNEL_BRANCH} |
+          | Kernel commit | \`${KERNEL_COMMIT}\` |
+          | KernelSU-Next tag | ${KSU_TAG} |
+          | KernelSU-Next commit | \`${KSU_COMMIT}\` |
+          | Kernel release string | \`${KERNEL_VERSION_STRING}\` |
+          | Clang | ${CLANG_URL} |
+          | AnyKernel3 | Template resmi terbaru dari osm0sis/AnyKernel3 |
+          | Image.gz-dtb sumber | ${{ github.event.inputs.image_gz_dtb_url }} |
+
+          ## Manager APK
+          ${{ github.event.inputs.manager_apk_url }}
+
+          Pastikan build number manager APK sama/lebih tinggi dari minimum yang disyaratkan rilis tersebut.
+
+          ## File
+          - \`${ZIP_FILENAME}\` — flashable ZIP (AnyKernel3), siap di-flash lewat TWRP/recovery
+
+          ## Cara Pasang
+          1. Reboot ke recovery (TWRP atau yang sejenis)
+          2. Flash \`${ZIP_FILENAME}\`
+          3. Reboot ke sistem
+          4. Install APK manager KernelSU-Next versi yang sesuai (lihat tautan di atas)
+          5. Buka app, pastikan status kernel terdeteksi aktif
+          EOF
+
+          cat CHANGELOG.md
+
+      - name: Upload Flashable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_FILENAME }}
+          path: ${{ env.ZIP_FILENAME }}
+          if-no-files-found: error
+
+      - name: Upload Changelog
+        uses: actions/upload-artifact@v4
+        with:
+          name: CHANGELOG
+          path: CHANGELOG.md
+          if-no-files-found: warn
