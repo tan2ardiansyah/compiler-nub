@@ -141,6 +141,43 @@ jobs:
 
           rm -f "$MAIN_MK.orig"
 
+      - name: Skip DTB yang tidak relevan/rusak (QVR headset, interposer SDM670)
+        run: |
+          cd kernel-src
+          DTS_MK="arch/arm64/boot/dts/qcom/Makefile"
+
+          if [ ! -f "$DTS_MK" ]; then
+            echo "PERINGATAN: $DTS_MK tidak ditemukan, skip step ini."
+            exit 0
+          fi
+
+          # 4 dtb ini BUKAN untuk Poco F1/beryllium (QVR = Qualcomm VR reference headset,
+          # interposer-sdm670 = board test interposer), dan rusak (phandle reference hilang)
+          # di kernel source ini. Kita hapus dari daftar build supaya target `dtbs`
+          # (yang menjadi dependency Image.gz-dtb) bisa sukses sepenuhnya.
+          BROKEN_DTBS=(
+            "sdm845-v2-qvr-evt.dtb"
+            "sdm845-v2-qvr-dvt.dtb"
+            "sdm845-interposer-sdm670-mtp.dtb"
+            "sdm845-interposer-sdm670-cdp.dtb"
+          )
+
+          cp "$DTS_MK" "$DTS_MK.orig"
+
+          for dtb in "${BROKEN_DTBS[@]}"; do
+            if grep -q "$dtb" "$DTS_MK"; then
+              sed -i "/$dtb/d" "$DTS_MK"
+              echo "[OK] Baris untuk $dtb dihapus dari $DTS_MK."
+            else
+              echo "[INFO] $dtb tidak ditemukan di $DTS_MK (mungkin sudah tidak ada / nama beda)."
+            fi
+          done
+
+          echo "== Diff perubahan =="
+          diff "$DTS_MK.orig" "$DTS_MK" || true
+
+          rm -f "$DTS_MK.orig"
+
       - name: Compile Kernel (test build, tidak untuk flash)
         env:
           KBUILD_BUILD_USER: "tester"
@@ -185,15 +222,32 @@ jobs:
 
           echo "== Exit code make: $BUILD_EXIT =="
           echo "== Cek apakah Image / Image.gz-dtb berhasil dihasilkan =="
-          ls -la "$OUT_DIR/arch/arm64/boot/Image" 2>/dev/null || echo "Image TIDAK ADA"
-          ls -la "$OUT_DIR/arch/arm64/boot/Image.gz-dtb" 2>/dev/null || echo "Image.gz-dtb TIDAK ADA"
+          IMAGE_OK=0
+          IMAGE_GZ_DTB_OK=0
 
-          # Selama Image utama berhasil, anggap build ini sukses meski ada dtb lain yang gagal.
           if [ -f "$OUT_DIR/arch/arm64/boot/Image" ]; then
-            echo "[OK] Image kernel berhasil dihasilkan walau exit code make=$BUILD_EXIT."
+            ls -la "$OUT_DIR/arch/arm64/boot/Image"
+            IMAGE_OK=1
+          else
+            echo "Image TIDAK ADA"
+          fi
+
+          if [ -f "$OUT_DIR/arch/arm64/boot/Image.gz-dtb" ]; then
+            ls -la "$OUT_DIR/arch/arm64/boot/Image.gz-dtb"
+            IMAGE_GZ_DTB_OK=1
+          else
+            echo "Image.gz-dtb TIDAK ADA"
+          fi
+
+          if [ "$IMAGE_GZ_DTB_OK" -eq 1 ]; then
+            echo "[OK] Image.gz-dtb berhasil dihasilkan lengkap (kernel + dtb beryllium). Ini yang dipakai untuk flash."
+            exit 0
+          elif [ "$IMAGE_OK" -eq 1 ]; then
+            echo "[SEBAGIAN OK] Image (vmlinux mentah) berhasil, tapi Image.gz-dtb belum ada."
+            echo "Kemungkinan target dtbs masih gagal di tempat lain, atau urutan build target dtb device beryllium belum sesuai."
             exit 0
           else
-            echo "[GAGAL] Image kernel tidak ditemukan. Build benar-benar gagal."
+            echo "[GAGAL] Baik Image maupun Image.gz-dtb tidak ditemukan. Build benar-benar gagal."
             exit 1
           fi
 
