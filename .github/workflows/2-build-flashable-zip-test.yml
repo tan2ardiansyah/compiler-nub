@@ -1,4 +1,4 @@
-name: 2. Build Flashable ZIP - AnyKernel3 (BOS Beryllium + KSU-Next + Log)
+name: 2. Build Flashable ZIP - AnyKernel3 (BOS Beryllium + KSU-Next)
 
 on:
   workflow_dispatch:
@@ -122,7 +122,7 @@ jobs:
 
           # Hapus contoh ramdisk/patch milik device referensi (maguro/tuna) bawaan template,
           # supaya tidak ada modifikasi ramdisk asing yang ikut diterapkan ke ROM lain.
-          rm -rf ramdisk patch vendor_ramdisk vendor_patch README.md version 2>/dev/null || true
+          rm -rf ramdisk patch vendor_ramdisk vendor_patch README.md version .git .github 2>/dev/null || true
 
           KERNEL_STRING="${{ github.event.inputs.kernel_string }}"
 
@@ -176,6 +176,20 @@ jobs:
           if n2 == 0:
               print("[PERINGATAN] Blok contoh ramdisk Galaxy Nexus tidak ditemukan. Mungkin upstream sudah ubah formatnya.")
 
+          # 3) Ganti BLOCK= dari path default template (OMAP, khusus Galaxy Nexus/maguro)
+          #    ke path standar Android modern yang dipakai SDM845/beryllium (lewat symlink by-name).
+          #    Path OMAP sama sekali tidak ada di SDM845; tools/ak3-core.sh kadang bisa fallback
+          #    otomatis kalau path tidak ditemukan, tapi lebih aman dituliskan eksplisit dan benar.
+          content, n3 = re.subn(
+              r"BLOCK=/dev/block/platform/omap/omap_hsmmc\.0/by-name/boot;",
+              "BLOCK=/dev/block/bootdevice/by-name/boot;",
+              content,
+              count=1,
+          )
+          print(f"[INFO] BLOCK= diganti ke path bootdevice standar: {n3} kali")
+          if n3 == 0:
+              print("[PERINGATAN] Baris BLOCK= path OMAP tidak ditemukan/tidak diganti. Mungkin upstream sudah ubah formatnya.")
+
           with open("anykernel.sh", "w") as f:
               f.write(content)
           PYEOF
@@ -193,7 +207,7 @@ jobs:
           ZIP_FILENAME="${{ github.event.inputs.zip_name }}-$(date -u +%Y%m%d).zip"
           echo "ZIP_FILENAME=$ZIP_FILENAME" >> "$GITHUB_ENV"
 
-          zip -r9 "../$ZIP_FILENAME" . -x .git README.md '*placeholder*'
+          zip -r9 "../$ZIP_FILENAME" . -x '.git/*' -x '.git' -x '.github/*' -x '.github' -x 'README.md' -x '*placeholder*'
           cd ..
           echo "== Isi zip yang dihasilkan =="
           unzip -l "$ZIP_FILENAME"
