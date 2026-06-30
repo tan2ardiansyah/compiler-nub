@@ -124,12 +124,16 @@ jobs:
           fi
 
           # Tambahkan config KSU (idempotent: defconfig kernel mengabaikan duplikat,
-          # baris terakhir untuk key yang sama akan dipakai oleh olddefconfig)
+          # baris terakhir untuk key yang sama akan dipakai oleh olddefconfig).
+          # Daftar ini mengikuti PERSIS dokumentasi resmi integrasi non-GKI KernelSU-Next
+          # (BUKAN dokumentasi KernelSU asli/tiann, yang punya CONFIG_HAVE_KPROBES tapi
+          # tidak punya CONFIG_KSU_KPROBE_HOOKS):
+          # https://kernelsu-next.github.io/webpage/pages/how-to-integrate-for-non-gki.html
           {
             echo "CONFIG_KSU=y"
             echo "CONFIG_KPROBES=y"
-            echo "CONFIG_HAVE_KPROBES=y"
             echo "CONFIG_KPROBE_EVENTS=y"
+            echo "CONFIG_KSU_KPROBE_HOOKS=y"
           } >> "$DEFCONFIG_PATH"
           echo "Defconfig $DEFCONFIG_PATH berhasil dipatch dengan opsi KSU."
 
@@ -239,8 +243,10 @@ jobs:
           make "${MAKE_ARGS[@]}" ${{ github.event.inputs.defconfig }}
           make "${MAKE_ARGS[@]}" olddefconfig
 
-          echo "== Cek CONFIG_KSU di .config hasil olddefconfig =="
-          grep "CONFIG_KSU" $OUT_DIR/.config || echo "PERINGATAN: CONFIG_KSU tidak ada di .config final! KSU mungkin tidak akan aktif."
+          echo "== Cek config KSU di .config hasil olddefconfig =="
+          for cfg in CONFIG_KSU CONFIG_KPROBES CONFIG_KPROBE_EVENTS CONFIG_KSU_KPROBE_HOOKS; do
+            grep "^${cfg}=" $OUT_DIR/.config || echo "PERINGATAN: ${cfg} tidak aktif di .config final!"
+          done
 
           # -k (keep going): jangan berhenti total kalau satu target dtb gagal
           # (misal dtb reference board Qualcomm yang tidak relevan untuk beryllium, contoh: sdm845-v2-qvr-evt.dtb).
