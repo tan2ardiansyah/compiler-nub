@@ -243,14 +243,12 @@ jobs:
       # Implementasi hook ada di drivers/kernelsu (ReSukiSU)
       # Kita cuma butuh deklarasi supaya call site di fs/*.c bisa compile
       # ==========================================================
-      - name: Generate ksu_hook.h (declarations only)
+      - name: Generate ksu_hook.h (6 hook declarations)
         run: |
           cd kernel-src
 
           cat > include/linux/ksu_hook.h << 'HEADEREOF'
-          /* Auto-generated for ReSukiSU manual hooks
-           * Deklarasi saja - implementasi ada di drivers/kernelsu
-           */
+          /* Auto-generated for ReSukiSU manual hooks */
           #ifndef __KSU_HOOK_H
           #define __KSU_HOOK_H
 
@@ -259,7 +257,10 @@ jobs:
 
           struct file;
           struct filename;
+          struct user_arg_ptr;
 
+          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
+                                          void *argv, void *envp, int *flags);
           extern int ksu_handle_faccessat(int *dfd, struct filename **filename_user,
                                           int *mode, int *flags);
           extern int ksu_handle_stat(int *dfd, struct filename **filename_user,
@@ -273,7 +274,7 @@ jobs:
           #endif
           HEADEREOF
 
-          echo "[OK] Generated ksu_hook.h"
+          echo "[OK] Generated ksu_hook.h dengan 6 declarations"
 
       # ==========================================================
       # Fix fs/exec.c: hapus struct user_arg_ptr duplikat
@@ -284,67 +285,34 @@ jobs:
 
           if [ ! -f fs/exec.c ]; then exit 0; fi
 
+          echo "== Cek keadaan awal fs/exec.c =="
+          grep -n "linux/ksud.h\|linux/ksu_hook.h\|user_arg_ptr {\|ksu_handle" fs/exec.c | head -15
+
+          # Kalau setup.sh sudah include ksud.h, hapus include-nya
+          # supaya tidak konflik dengan definisi struct user_arg_ptr lokal
           if grep -q "linux/ksud.h" fs/exec.c; then
-            echo "[INFO] Removing struct user_arg_ptr (nested #ifdef aware)"
-            python3 << 'PYEOF'
-          from pathlib import Path
-
-          p = Path("fs/exec.c")
-          lines = p.read_text().split('\n')
-
-          # Cari 'struct user_arg_ptr {' dan hapus sampai '};' dengan
-          # balance-brace matching (bukan regex)
-          new_lines = []
-          i = 0
-          removed = False
-          while i < len(lines):
-              line = lines[i]
-              # Cek apakah ini definisi struct (bukan pemakaian)
-              if line.strip().startswith('struct user_arg_ptr {') and not removed:
-                  # Hitung brace mulai dari sini
-                  brace_count = 0
-                  # Skip sampai ketemu '};' dengan brace balance = 0
-                  j = i
-                  while j < len(lines):
-                      brace_count += lines[j].count('{')
-                      brace_count -= lines[j].count('}')
-                      if brace_count == 0 and '};' in lines[j]:
-                          break
-                      j += 1
-                  # Replace lines i..j dengan comment
-                  new_lines.append('/* struct user_arg_ptr moved to linux/ksud.h */')
-                  print(f"[OK] Removed struct user_arg_ptr (lines {i+1}..{j+1})")
-                  i = j + 1
-                  removed = True
-                  continue
-              new_lines.append(line)
-              i += 1
-
-          if not removed:
-              print("[SKIP] struct user_arg_ptr not found")
-
-          p.write_text('\n'.join(new_lines))
-          PYEOF
+            echo "[INFO] Removing #include <linux/ksud.h> (konflik dengan definisi lokal)"
+            sed -i '/#include <linux\/ksud\.h>/d' fs/exec.c
           fi
 
-          # Cek juga apakah ada hook execveat manual yang duplikat
-          if grep -q "^\s*ksu_handle_execveat(&fd" fs/exec.c; then
-            echo "[INFO] Removing duplicate manual execveat hook"
-            sed -i '/\/\* ReSukiSU hook \*\//{N;/ksu_handle_execveat(&fd/d}' fs/exec.c
+          # Kalau setup.sh sudah inject panggilan ksu_handle_execveat_ksud,
+          # hapus juga (kita akan pakai versi manual ksu_handle_execveat biasa)
+          if grep -q "ksu_handle_execveat_ksud" fs/exec.c; then
+            echo "[INFO] Removing ksu_handle_execveat_ksud call"
+            sed -i '/ksu_handle_execveat_ksud/d' fs/exec.c
           fi
 
           echo ""
           echo "== fs/exec.c setelah fix =="
-          grep -n "user_arg_ptr\|ksud.h\|ksu_handle_execveat" fs/exec.c | head -10
+          grep -n "linux/ksud.h\|linux/ksu_hook.h\|user_arg_ptr {\|ksu_handle" fs/exec.c | head -15
 
       # ==========================================================
       # Inject 5 manual hooks (execveat sudah oleh setup.sh)
       # ==========================================================
-      - name: Apply 5 manual hooks
+      - name: Apply 6 manual hooks (termasuk execveat)
         run: |
           cd kernel-src
 
-          # awk inject setelah opening brace
           inject_hook() {
             local file="$1"
             local func_pat="$2"
@@ -372,14 +340,30 @@ jobs:
             fi
           }
 
-          # 1. fs/open.c → faccessat (signature: SYSCALL_DEFINE3(faccessat, ...))
-          # Parameter: dfd, filename, mode (no flags)
+          # 0. fs/exec.c → execveat (WAJIB, jangan bergantung pada setup.sh)
+          add_include fs/exec.c
+          if ! grep -q "ksu_handle_execveat" fs/exec.c; then
+            # Coba pattern do_execveat_common dulu (kernel 4.9 typical)
+            inject_hook fs/exec.c "static int do_execveat_common" \
+              "ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);"
+            if ! grep -q "ksu_handle_execveat" fs/exec.c; then
+              inject_hook fs/exec.c "int do_execveat_common" \
+                "ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);"
+            fi
+            if ! grep -q "ksu_handle_execveat" fs/exec.c; then
+              inject_hook fs/exec.c "do_execveat_common" \
+                "ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);"
+            fi
+            echo "[OK] fs/exec.c execveat"
+          fi
+
+          # 1. fs/open.c → faccessat
           add_include fs/open.c
           if ! grep -q "ksu_handle_faccessat" fs/open.c; then
             inject_hook fs/open.c \
               "SYSCALL_DEFINE3.faccessat" \
               "ksu_handle_faccessat(&dfd, (struct filename **)&filename, &mode, NULL);"
-            echo "[OK] fs/open.c"
+            echo "[OK] fs/open.c faccessat"
           fi
 
           # 2. fs/read_write.c → vfs_read
@@ -391,15 +375,10 @@ jobs:
           fi
 
           # 3. fs/stat.c → stat
-          # PENTING: cek dulu fungsi mana yang ada, karena kernel 4.9 bisa punya:
-          # - vfs_fstatat (kalau ada)
-          # - SYSCALL_DEFINE4(newfstatat, ...) sebagai gantinya
           add_include fs/stat.c
           if ! grep -q "ksu_handle_stat" fs/stat.c; then
-            # Coba vfs_fstatat dulu
             inject_hook fs/stat.c "int vfs_fstatat" \
               "ksu_handle_stat(&dfd, &filename, &flag);"
-            # Kalau tidak ada, coba newfstatat
             if ! grep -q "ksu_handle_stat" fs/stat.c; then
               inject_hook fs/stat.c "SYSCALL_DEFINE4.newfstatat" \
                 "ksu_handle_stat(&dfd, (struct filename **)&filename, &flag);"
@@ -491,6 +470,29 @@ jobs:
           for dtb in sdm845-v2-qvr-evt.dtb sdm845-v2-qvr-dvt.dtb sdm845-interposer-sdm670-mtp.dtb sdm845-interposer-sdm670-cdp.dtb; do
             sed -i "/$dtb/d" "$DTS_MK"
           done
+
+      - name: Debug - cek fs/exec.c setelah semua fix
+        run: |
+          cd kernel-src
+          echo "=========================================="
+          echo "1. Cek include di fs/exec.c"
+          echo "=========================================="
+          grep -n "#include" fs/exec.c | head -20
+          echo ""
+          echo "=========================================="
+          echo "2. Cek keberadaan ksu_handle / ksud"
+          echo "=========================================="
+          grep -n "ksu_handle\|ksud\|user_arg_ptr" fs/exec.c | head -20
+          echo ""
+          echo "=========================================="
+          echo "3. Cek fungsi do_execveat_common (context)"
+          echo "=========================================="
+          grep -n "do_execveat_common\|do_execveat\|__do_execve" fs/exec.c | head -10
+          echo ""
+          echo "=========================================="
+          echo "4. Cek isi ksud.h"
+          echo "=========================================="
+          cat include/linux/ksud.h 2>/dev/null | head -40
 
       - name: Compile Kernel
         env:
