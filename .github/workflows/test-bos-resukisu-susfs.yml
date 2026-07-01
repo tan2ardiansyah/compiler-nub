@@ -106,21 +106,11 @@ jobs:
           echo "KSU_DIR=$KSU_DIR" >> "$GITHUB_ENV"
           echo "Folder driver KSU terdeteksi: $KSU_DIR"
 
-      - name: Clone SUSFS & Apply Patches (kernel-4.9)
+      - name: Clone SUSFS & Apply Patches (kernel-4.9, via JackA1ltman patch)
         run: |
           cd kernel-src
 
-          # Clone susfs4ksu branch/tag khusus kernel 4.9
-          git clone --depth=1 \
-            -b "${{ github.event.inputs.susfs_tag }}" \
-            "https://gitlab.com/simonpunk/susfs4ksu.git" susfs4ksu-src
-
-          echo "== Struktur susfs4ksu yang di-clone =="
-          ls -la susfs4ksu-src/kernel_patches/
-          ls -la susfs4ksu-src/kernel_patches/KernelSU/ 2>/dev/null || echo "(tidak ada subfolder KernelSU)"
-
-          # Tentukan nama folder KSU yang benar (kernelsu atau ReSukiSU)
-          KSU_KERNEL_DIR="KernelSU"
+          # Tentukan nama folder KSU root yang dibuat setup.sh (kernelsu atau ReSukiSU)
           if [ -d "KernelSU" ]; then
             KSU_KERNEL_DIR="KernelSU"
           elif [ -d "ReSukiSU" ]; then
@@ -128,32 +118,68 @@ jobs:
           else
             echo "PERINGATAN: Tidak menemukan folder KernelSU atau ReSukiSU di root!"
             ls -la
+            exit 1
           fi
-          echo "KSU_KERNEL_DIR=$KSU_KERNEL_DIR" >> "$GITHUB_ENV"
           echo "Folder root KSU: $KSU_KERNEL_DIR"
 
-          # Patch 1: enable SUSFS di dalam folder KernelSU/ReSukiSU
+          # Clone susfs4ksu (resmi, untuk patch KSU-side)
+          git clone --depth=1 \
+            -b "${{ github.event.inputs.susfs_tag }}" \
+            "https://gitlab.com/simonpunk/susfs4ksu.git" susfs4ksu-src
+
+          echo "== Struktur susfs4ksu yang di-clone =="
+          ls -la susfs4ksu-src/kernel_patches/
+          ls -la susfs4ksu-src/kernel_patches/KernelSU/ 2>/dev/null || \
+            echo "(tidak ada subfolder KernelSU di patch folder)"
+
+          # Patch 1: enable SUSFS di dalam folder KernelSU/ReSukiSU (patch dari repo SUSFS resmi)
+          # Patch ini memodifikasi kode sisi KSU (bukan sisi kernel), sehingga tetap pakai
+          # dari repo SUSFS resmi yang paling up-to-date untuk bagian ini.
           PATCH1="susfs4ksu-src/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
           if [ -f "$PATCH1" ]; then
+            echo "== Menerapkan Patch 1: 10_enable_susfs_for_ksu.patch ke $KSU_KERNEL_DIR/ =="
             cp "$PATCH1" "$KSU_KERNEL_DIR/"
             cd "$KSU_KERNEL_DIR"
-            echo "== Menerapkan patch 1: 10_enable_susfs_for_ksu.patch =="
-            patch -p1 < 10_enable_susfs_for_ksu.patch && echo "[OK] Patch 1 berhasil." || echo "[PERINGATAN] Patch 1 ada yang gagal, lanjut compile."
+            patch -p1 --forward < 10_enable_susfs_for_ksu.patch \
+              && echo "[OK] Patch 1 berhasil." \
+              || echo "[PERINGATAN] Patch 1 ada hunk yang gagal (mungkin sudah include). Lanjut."
             cd ..
           else
-            echo "[INFO] Patch 1 (10_enable_susfs_for_ksu.patch) tidak ditemukan, kemungkinan ReSukiSU sudah include SUSFS bawaan."
+            echo "[INFO] Patch 1 tidak ditemukan. Kemungkinan ReSukiSU sudah include SUSFS bawaan."
           fi
 
-          # Patch 2: tambahkan SUSFS ke kernel source
-          PATCH2=$(ls susfs4ksu-src/kernel_patches/50_add_susfs_in_kernel*.patch 2>/dev/null | head -1)
-          if [ -n "$PATCH2" ]; then
-            cp "$PATCH2" .
-            PATCH2_FILENAME=$(basename "$PATCH2")
-            echo "== Menerapkan patch 2: $PATCH2_FILENAME =="
-            patch -p1 < "$PATCH2_FILENAME" && echo "[OK] Patch 2 berhasil." || echo "[PERINGATAN] Patch 2 ada yang gagal, lanjut compile."
+          # Patch 2: tambahkan SUSFS ke kernel source (kernel-side)
+          # KUNCI: pakai patch khusus kernel-4.9 dari JackA1ltman/NonGKI_Kernel_Build_2nd
+          # yang sudah disesuaikan untuk kernel 4.9, bukan patch generik dari repo SUSFS resmi.
+          # Patch resmi (50_add_susfs_in_kernel-4.9.patch) terbukti gagal apply di percobaan
+          # sebelumnya karena perbedaan struktur dengan kernel BaikalOS kita (downstream SDM845).
+          PATCH2_URL="https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/Patch/susfs_patch_to_4.9.patch"
+          echo "== Mengunduh patch susfs_patch_to_4.9.patch dari JackA1ltman =="
+          curl -LSs -o susfs_patch_to_4.9.patch "$PATCH2_URL"
+          wc -l susfs_patch_to_4.9.patch
+
+          echo "== Menerapkan Patch 2: susfs_patch_to_4.9.patch ke root kernel =="
+          patch -p1 --forward < susfs_patch_to_4.9.patch \
+            && echo "[OK] Patch 2 berhasil sepenuhnya." \
+            || {
+              echo "[PERINGATAN] Patch 2 ada hunk yang gagal/reject."
+              echo "Cek file .rej untuk detail:"
+              find . -name "*.rej" | head -20
+            }
+
+          # Verifikasi: cek apakah susfs.h sudah ada (indikator utama patch sukses)
+          if [ -f "include/linux/susfs.h" ]; then
+            echo "[OK] include/linux/susfs.h ditemukan — patch kernel-side berhasil."
           else
-            echo "PERINGATAN: Patch 2 (50_add_susfs_in_kernel*.patch) tidak ditemukan!"
-            ls susfs4ksu-src/kernel_patches/
+            echo "[PERINGATAN] include/linux/susfs.h TIDAK ditemukan!"
+            echo "Patch mungkin tidak berhasil menambahkan file SUSFS ke kernel."
+          fi
+
+          # Verifikasi: cek apakah fs/susfs.c ada
+          if [ -f "fs/susfs.c" ]; then
+            echo "[OK] fs/susfs.c ditemukan."
+          else
+            echo "[PERINGATAN] fs/susfs.c TIDAK ditemukan!"
           fi
 
       - name: Siapkan defconfig (config extract BaikalOS + tambahan ReSukiSU+SUSFS)
@@ -180,9 +206,12 @@ jobs:
           # Tambahkan config ReSukiSU + SUSFS
           # Referensi: https://resukisu.github.io/guide/manual-integrate.html
           # dan https://gitlab.com/simonpunk/susfs4ksu
+          # CATATAN: CONFIG_KSU_MANUAL_HOOK sengaja TIDAK diset di sini karena
+          # ia dan CONFIG_KSU_SUSFS berada dalam satu `choice {}` block di Kconfig ReSukiSU,
+          # sehingga menyebabkan "recursive dependency" error jika keduanya diset bersamaan.
+          # Biarkan Kconfig memilih hook mode secara otomatis berdasarkan pilihan default-nya.
           {
             echo "CONFIG_KSU=y"
-            echo "CONFIG_KSU_MANUAL_HOOK=y"
             echo "CONFIG_KPM=y"
             echo "CONFIG_KALLSYMS=y"
             echo "CONFIG_KALLSYMS_ALL=y"
