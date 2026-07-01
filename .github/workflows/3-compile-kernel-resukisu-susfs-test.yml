@@ -158,11 +158,8 @@ jobs:
           echo "==========================================="
           echo "Fix 1: fs/proc_namespace.c hunk #1"
           echo "==========================================="
-          # Tambah include susfs_def.h dan extern declarations
-          # Kalau belum ada
           if [ -f fs/proc_namespace.c ]; then
             if ! grep -q "susfs_def.h" fs/proc_namespace.c; then
-              # Sisipkan setelah baris #include "proc/internal.h"
               sed -i '/#include "proc\/internal.h"/a\
           #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\
           #include <linux/susfs_def.h>\
@@ -171,7 +168,6 @@ jobs:
             fi
 
             if ! grep -q "susfs_is_current_ksu_domain" fs/proc_namespace.c; then
-              # Sisipkan setelah baris #include "internal.h"
               sed -i '/#include "internal.h"/a\
           \
           #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\
@@ -183,25 +179,13 @@ jobs:
           fi
 
           echo ""
-          echo "== Verifikasi fs/proc_namespace.c =="
-          grep -n "susfs" fs/proc_namespace.c | head -15
-
-          echo ""
           echo "==========================================="
-          echo "Fix 2: fs/stat.c hunk #3"
+          echo "Fix 2: fs/stat.c - signature kernel 4.9 BaikalOS"
           echo "==========================================="
-          # Wrap inode->i_op->getattr dengan susfs spoof
-          # Sebelum:
-          #   if (inode->i_op->getattr)
-          #       return inode->i_op->getattr(path, stat, request_mask, query_flags);
-          # Sesudah:
-          #   if (inode->i_op->getattr)
-          #   #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
-          #   { ... spoof ... }
-          #   #else
-          #       return inode->i_op->getattr(...);
-          #   #endif
-          if [ -f fs/stat.c ] && ! grep -q "susfs_sus_kstat_spoof_generic_fillattr" fs/stat.c; then
+          # Signature real:
+          #   return inode->i_op->getattr(path->mnt, path->dentry, stat);
+          # Kita wrap dengan #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+          if [ -f fs/stat.c ] && ! grep -q "int err = inode->i_op->getattr" fs/stat.c; then
             python3 << 'PYEOF'
           import re
           from pathlib import Path
@@ -209,12 +193,12 @@ jobs:
           p = Path("fs/stat.c")
           text = p.read_text()
 
-          # Cari pattern:
-          #   if (inode->i_op->getattr)
-          #       return inode->i_op->getattr(path, stat, request_mask, query_flags);
+          # Pattern signature kernel 4.9 BaikalOS
+          # if (inode->i_op->getattr)
+          #     return inode->i_op->getattr(path->mnt, path->dentry, stat);
           pattern = re.compile(
-              r'(if\s*\(inode->i_op->getattr\)\s*\n\s*)'
-              r'(return inode->i_op->getattr\(path,\s*stat,\s*request_mask,\s*\n?\s*query_flags\);)',
+              r'(\tif\s*\(inode->i_op->getattr\)\s*\n)'
+              r'(\t\treturn inode->i_op->getattr\(path->mnt,\s*path->dentry,\s*stat\);)',
               re.MULTILINE
           )
 
@@ -222,62 +206,36 @@ jobs:
               r'\1'
               '#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n'
               '\t{\n'
-              '\t\tint err = inode->i_op->getattr(path, stat, request_mask,\n'
-              '\t\t\t\t\t    query_flags);\n'
+              '\t\tint err = inode->i_op->getattr(path->mnt, path->dentry, stat);\n'
               '\t\tif (!err)\n'
               '\t\t\tsusfs_sus_kstat_spoof_generic_fillattr(inode, stat);\n'
               '\t\treturn err;\n'
               '\t}\n'
               '#else\n'
-              '\t\t\\2\n'
-              '#endif'
+              r'\2'
+              '\n#endif'
           )
 
           new_text, n = pattern.subn(replacement, text)
           if n > 0:
               p.write_text(new_text)
-              print(f"[OK] Wrapped inode->i_op->getattr with SUSFS spoof")
+              print(f"[OK] Wrapped inode->i_op->getattr ({n} match)")
           else:
-              print("[WARN] Pattern not found, trying simpler approach...")
-              # Fallback: cari 'return inode->i_op->getattr' saja
-              simpler = re.compile(
-                  r'(\treturn inode->i_op->getattr\([^;]+\);)',
-                  re.MULTILINE
-              )
-              def replace(m):
-                  original = m.group(1)
-                  return (
-                      '#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n'
-                      '\t{\n'
-                      '\t\tint err = inode->i_op->getattr(path, stat, request_mask, query_flags);\n'
-                      '\t\tif (!err)\n'
-                      '\t\t\tsusfs_sus_kstat_spoof_generic_fillattr(inode, stat);\n'
-                      '\t\treturn err;\n'
-                      '\t}\n'
-                      '#else\n'
-                      + original + '\n'
-                      '#endif'
-                  )
-              new_text, n = simpler.subn(replace, text, count=1)
-              if n > 0:
-                  p.write_text(new_text)
-                  print(f"[OK] Fallback: wrapped with SUSFS spoof")
-              else:
-                  print("[FAIL] Could not find inode->i_op->getattr pattern")
+              print("[FAIL] Pattern not matched, showing current state:")
+              for i, line in enumerate(text.split('\n')[55:75], start=56):
+                  print(f"  {i}: {line}")
           PYEOF
-            echo "[OK] Fixed fs/stat.c hunk #3"
           fi
 
           echo ""
           echo "== Verifikasi fs/stat.c =="
-          grep -n "susfs\|inode->i_op->getattr" fs/stat.c | head -20
+          grep -n "susfs\|inode->i_op->getattr" fs/stat.c | head -15
 
           echo ""
           echo "==========================================="
           echo "Fix 3: fs/proc/task_mmu.c hunk #4"
           echo "==========================================="
-          echo "[SKIP] Hunk ini cuma trailing whitespace difference"
-          echo "Tidak berpengaruh ke functionality, bisa dilewati"
+          echo "[SKIP] Whitespace difference only"
 
       # ==========================================================
       # Buat ksu_hook.h dengan deklarasi 5 hooks (bukan stub)
@@ -326,48 +284,58 @@ jobs:
 
           if [ ! -f fs/exec.c ]; then exit 0; fi
 
-          # setup.sh sudah include ksud.h yang punya struct user_arg_ptr
-          # fs/exec.c juga punya definisi sendiri → redefinition
           if grep -q "linux/ksud.h" fs/exec.c; then
-            echo "[INFO] Removing local struct user_arg_ptr (now in ksud.h)"
+            echo "[INFO] Removing struct user_arg_ptr (nested #ifdef aware)"
             python3 << 'PYEOF'
-          import re
           from pathlib import Path
 
           p = Path("fs/exec.c")
-          text = p.read_text()
+          lines = p.read_text().split('\n')
 
-          # Match struct user_arg_ptr { ... };
-          pattern = re.compile(
-              r'struct user_arg_ptr\s*\{[^}]*?\};',
-              re.DOTALL
-          )
-          new_text, n = pattern.subn(
-              '/* struct user_arg_ptr definition moved to linux/ksud.h */',
-              text, count=1
-          )
-          if n > 0:
-              p.write_text(new_text)
-              print(f"[OK] Removed struct user_arg_ptr")
-          else:
+          # Cari 'struct user_arg_ptr {' dan hapus sampai '};' dengan
+          # balance-brace matching (bukan regex)
+          new_lines = []
+          i = 0
+          removed = False
+          while i < len(lines):
+              line = lines[i]
+              # Cek apakah ini definisi struct (bukan pemakaian)
+              if line.strip().startswith('struct user_arg_ptr {') and not removed:
+                  # Hitung brace mulai dari sini
+                  brace_count = 0
+                  # Skip sampai ketemu '};' dengan brace balance = 0
+                  j = i
+                  while j < len(lines):
+                      brace_count += lines[j].count('{')
+                      brace_count -= lines[j].count('}')
+                      if brace_count == 0 and '};' in lines[j]:
+                          break
+                      j += 1
+                  # Replace lines i..j dengan comment
+                  new_lines.append('/* struct user_arg_ptr moved to linux/ksud.h */')
+                  print(f"[OK] Removed struct user_arg_ptr (lines {i+1}..{j+1})")
+                  i = j + 1
+                  removed = True
+                  continue
+              new_lines.append(line)
+              i += 1
+
+          if not removed:
               print("[SKIP] struct user_arg_ptr not found")
+
+          p.write_text('\n'.join(new_lines))
           PYEOF
           fi
 
-          # Hapus juga hook execveat manual yang kita inject sebelumnya (kalau ada)
-          # karena setup.sh sudah handle
-          if grep -q "ksu_handle_execveat(" fs/exec.c; then
-            # Cek apakah ini call kita atau bawaan setup.sh
-            # Bawaan setup.sh biasanya "ksu_handle_execveat_ksud" atau di dalam #ifdef
-            # Kalau ada baris standalone "ksu_handle_execveat(&fd, ..." → itu punya kita
-            if grep -q "^\s*ksu_handle_execveat(&fd" fs/exec.c; then
-              echo "[INFO] Removing duplicate manual execveat hook"
-              sed -i '/\/\* ReSukiSU hook \*\//{N;/ksu_handle_execveat(&fd/d}' fs/exec.c
-            fi
+          # Cek juga apakah ada hook execveat manual yang duplikat
+          if grep -q "^\s*ksu_handle_execveat(&fd" fs/exec.c; then
+            echo "[INFO] Removing duplicate manual execveat hook"
+            sed -i '/\/\* ReSukiSU hook \*\//{N;/ksu_handle_execveat(&fd/d}' fs/exec.c
           fi
 
+          echo ""
           echo "== fs/exec.c setelah fix =="
-          grep -n "user_arg_ptr\|ksud.h\|ksu_handle_execveat" fs/exec.c | head -15
+          grep -n "user_arg_ptr\|ksud.h\|ksu_handle_execveat" fs/exec.c | head -10
 
       # ==========================================================
       # Inject 5 manual hooks (execveat sudah oleh setup.sh)
@@ -376,6 +344,7 @@ jobs:
         run: |
           cd kernel-src
 
+          # awk inject setelah opening brace
           inject_hook() {
             local file="$1"
             local func_pat="$2"
@@ -403,11 +372,13 @@ jobs:
             fi
           }
 
-          # 1. fs/open.c → faccessat
+          # 1. fs/open.c → faccessat (signature: SYSCALL_DEFINE3(faccessat, ...))
+          # Parameter: dfd, filename, mode (no flags)
           add_include fs/open.c
           if ! grep -q "ksu_handle_faccessat" fs/open.c; then
-            inject_hook fs/open.c "long do_faccessat" \
-              "ksu_handle_faccessat(&dfd, &filename, &mode, NULL);"
+            inject_hook fs/open.c \
+              "SYSCALL_DEFINE3.faccessat" \
+              "ksu_handle_faccessat(&dfd, (struct filename **)&filename, &mode, NULL);"
             echo "[OK] fs/open.c"
           fi
 
@@ -419,11 +390,20 @@ jobs:
             echo "[OK] fs/read_write.c"
           fi
 
-          # 3. fs/stat.c → stat (pakai flag)
+          # 3. fs/stat.c → stat
+          # PENTING: cek dulu fungsi mana yang ada, karena kernel 4.9 bisa punya:
+          # - vfs_fstatat (kalau ada)
+          # - SYSCALL_DEFINE4(newfstatat, ...) sebagai gantinya
           add_include fs/stat.c
           if ! grep -q "ksu_handle_stat" fs/stat.c; then
+            # Coba vfs_fstatat dulu
             inject_hook fs/stat.c "int vfs_fstatat" \
               "ksu_handle_stat(&dfd, &filename, &flag);"
+            # Kalau tidak ada, coba newfstatat
+            if ! grep -q "ksu_handle_stat" fs/stat.c; then
+              inject_hook fs/stat.c "SYSCALL_DEFINE4.newfstatat" \
+                "ksu_handle_stat(&dfd, (struct filename **)&filename, &flag);"
+            fi
             echo "[OK] fs/stat.c"
           fi
 
