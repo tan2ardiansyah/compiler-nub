@@ -347,6 +347,64 @@ jobs:
           echo "== Verifikasi extern di fs/stat.c =="
           grep -n "extern\|susfs_sus_kstat" fs/stat.c | head -10
 
+          echo ""
+          echo "==========================================="
+          echo "Fix 7: Hapus stray call di scope global fs/stat.c"
+          echo "==========================================="
+          # Patch SUSFS inject call di posisi salah (di luar function)
+          # setelah EXPORT_SYMBOL(vfs_getattr_nosec)
+          # Line 82 punya standalone call yang bikin error 'type specifier missing'
+          # Kita hapus 3 baris tersebut karena wrapping yg benar sudah ada di dalam function
+          if [ -f fs/stat.c ] && grep -q "^EXPORT_SYMBOL(vfs_getattr_nosec);$" fs/stat.c; then
+            python3 << 'PYEOF'
+          from pathlib import Path
+          p = Path("fs/stat.c")
+          lines = p.read_text().split('\n')
+
+          # Cari EXPORT_SYMBOL(vfs_getattr_nosec);
+          # Setelah baris itu, kalau ada #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+          # + call susfs_sus_kstat_spoof + #endif → hapus 3 baris
+          new_lines = []
+          i = 0
+          removed = False
+          while i < len(lines):
+              line = lines[i]
+              new_lines.append(line)
+
+              if (not removed
+                  and line.strip() == 'EXPORT_SYMBOL(vfs_getattr_nosec);'
+                  and i + 3 < len(lines)):
+
+                  # Cek 3 baris berikutnya
+                  next1 = lines[i+1].strip()
+                  next2 = lines[i+2].strip()
+                  next3 = lines[i+3].strip()
+
+                  if (next1 == '#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT'
+                      and 'susfs_sus_kstat_spoof_generic_fillattr' in next2
+                      and next3 == '#endif'):
+                      # Skip 3 baris
+                      print(f"[OK] Removed stray call at line {i+2}")
+                      print(f"     Line {i+2}: {lines[i+1]}")
+                      print(f"     Line {i+3}: {lines[i+2]}")
+                      print(f"     Line {i+4}: {lines[i+3]}")
+                      i += 4
+                      removed = True
+                      continue
+
+              i += 1
+
+          if not removed:
+              print("[SKIP] Stray call pattern not found")
+
+          p.write_text('\n'.join(new_lines))
+          PYEOF
+          fi
+
+          echo ""
+          echo "== Verifikasi fs/stat.c line 75-90 setelah Fix 7 =="
+          sed -n '75,90p' fs/stat.c
+
       # ==========================================================
       # Buat ksu_hook.h dengan deklarasi 5 hooks (bukan stub)
       # ==========================================================
