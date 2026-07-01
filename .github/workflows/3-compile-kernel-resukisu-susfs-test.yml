@@ -307,6 +307,48 @@ jobs:
           echo "== Verifikasi extern di fs/proc_namespace.c =="
           grep -n "extern\|susfs" fs/proc_namespace.c | head -15
 
+          echo ""
+          echo "==========================================="
+          echo "Fix 6: Ensure susfs functions declared BEFORE first use"
+          echo "==========================================="
+          # Susfs patch inject call ke fs/stat.c tapi declaration
+          # susfs_sus_kstat_spoof_generic_fillattr mungkin belum ter-inject
+          # atau posisinya setelah call
+          #
+          # Solusi: inject forward declaration di awal fs/stat.c
+          if [ -f fs/stat.c ] && ! grep -q "extern void susfs_sus_kstat_spoof_generic_fillattr" fs/stat.c; then
+            python3 << 'PYEOF'
+          from pathlib import Path
+          p = Path("fs/stat.c")
+          lines = p.read_text().split('\n')
+
+          # Cari #include terakhir
+          last_include = -1
+          for i, line in enumerate(lines):
+              if line.strip().startswith('#include'):
+                  last_include = i
+
+          if last_include == -1:
+              print("[FAIL] No #include found")
+          else:
+              # Sisipkan forward declaration setelah #include terakhir
+              decl_block = [
+                  '',
+                  '#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT',
+                  'extern void susfs_sus_kstat_spoof_generic_fillattr(struct inode *inode, struct kstat *stat);',
+                  '#endif',
+                  '',
+              ]
+              lines[last_include+1:last_include+1] = decl_block
+              p.write_text('\n'.join(lines))
+              print("[OK] Injected forward declaration")
+          PYEOF
+          fi
+
+          echo ""
+          echo "== Verifikasi extern di fs/stat.c =="
+          grep -n "extern\|susfs_sus_kstat_spoof" fs/stat.c | head -10
+
       # ==========================================================
       # Buat ksu_hook.h dengan deklarasi 5 hooks (bukan stub)
       # ==========================================================
@@ -555,28 +597,20 @@ jobs:
             sed -i "/$dtb/d" "$DTS_MK"
           done
 
-      - name: Debug - cek fs/exec.c setelah semua fix
+      - name: Debug - cek fs/stat.c dan susfs.h
         run: |
           cd kernel-src
-          echo "=========================================="
-          echo "1. Cek include di fs/exec.c"
-          echo "=========================================="
-          grep -n "#include" fs/exec.c | head -20
+          echo "== fs/stat.c line 70-90 =="
+          sed -n '70,90p' fs/stat.c
           echo ""
-          echo "=========================================="
-          echo "2. Cek keberadaan ksu_handle / ksud"
-          echo "=========================================="
-          grep -n "ksu_handle\|ksud\|user_arg_ptr" fs/exec.c | head -20
+          echo "== Declaration susfs_sus_kstat_spoof_generic_fillattr di header =="
+          grep -rn "susfs_sus_kstat_spoof_generic_fillattr" include/linux/ 2>/dev/null
           echo ""
-          echo "=========================================="
-          echo "3. Cek fungsi do_execveat_common (context)"
-          echo "=========================================="
-          grep -n "do_execveat_common\|do_execveat\|__do_execve" fs/exec.c | head -10
+          echo "== Definition di fs/susfs.c =="
+          grep -n "susfs_sus_kstat_spoof_generic_fillattr" fs/susfs.c 2>/dev/null | head -5
           echo ""
-          echo "=========================================="
-          echo "4. Cek isi ksud.h"
-          echo "=========================================="
-          cat include/linux/ksud.h 2>/dev/null | head -40
+          echo "== Include di fs/stat.c =="
+          grep -n "#include" fs/stat.c | head -15
 
       - name: Compile Kernel
         env:
