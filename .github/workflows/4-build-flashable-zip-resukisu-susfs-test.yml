@@ -11,7 +11,7 @@ on:
         required: true
         default: 'bos-beryllium-resukisu-susfs'
       zip_name:
-        description: 'Nama Build untuk ZIP output workflow ini'
+        description: 'Nama Build untuk artifact output workflow ini'
         required: true
         default: 'bos-beryllium-resukisu-susfs'
       kernel_string:
@@ -36,7 +36,6 @@ permissions:
 
 env:
   # Mapping manager → GitHub repo URL
-  # Format ini dipakai untuk generate link download di changelog
   MANAGER_REPOS: |
     ReSukiSU=https://github.com/ReSukiSU/ReSukiSU
     SukiSU-Ultra=https://github.com/SukiSU-Ultra/SukiSU-Ultra
@@ -103,7 +102,6 @@ jobs:
           MANAGER="${{ github.event.inputs.manager_choice }}"
           echo "Manager pilihan: $MANAGER"
 
-          # Extract repo URL untuk manager yang dipilih
           MANAGER_REPO=$(echo "$MANAGER_REPOS" | grep "^${MANAGER}=" | cut -d= -f2)
 
           if [ -z "$MANAGER_REPO" ]; then
@@ -113,7 +111,6 @@ jobs:
 
           echo "Manager repo: $MANAGER_REPO"
 
-          # Cek apakah repo bisa diakses (bukan 404)
           HTTP_STATUS=$(curl -o /dev/null -s -w "%{http_code}" -L "$MANAGER_REPO")
           if [ "$HTTP_STATUS" = "200" ]; then
             MANAGER_RELEASE_URL="${MANAGER_REPO}/releases/latest"
@@ -140,7 +137,7 @@ jobs:
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3-build
           cd ak3-build
 
-          # Bersihkan file demo maguro/tuna
+          # Bersihkan file demo maguro/tuna + git metadata
           rm -rf ramdisk patch vendor_ramdisk vendor_patch README.md version .git .github 2>/dev/null || true
 
           python3 << 'PYEOF'
@@ -179,7 +176,7 @@ jobs:
           )
           print(f"[INFO] Blok properties() diganti: {n1} kali")
 
-          # 2. Hapus blok contoh ramdisk Galaxy Nexus
+          # 2. Hapus blok contoh ramdisk Galaxy Nexus (tuna)
           tuna_pattern = re.compile(
               r"# init\.rc\n.*?append_file fstab\.tuna \"usbdisk\" fstab;\n\n",
               re.DOTALL,
@@ -209,43 +206,38 @@ jobs:
         env:
           KERNEL_STRING_ENV: ${{ github.event.inputs.kernel_string }}
 
-      - name: 7. Tampilkan anykernel.sh & masukkan Image.gz-dtb
+      - name: 7. Tampilkan anykernel.sh setelah patch
         run: |
           cd ak3-build
           echo "== anykernel.sh setelah patch =="
           cat anykernel.sh
-          echo ""
-          echo "== Copy Image.gz-dtb =="
-          cp ../Image.gz-dtb .
-          ls -la Image.gz-dtb
-
-      - name: 8. Build flashable ZIP
-        run: |
-          cd ak3-build
-          ZIP_FILENAME="${{ github.event.inputs.zip_name }}-$(date -u +%Y%m%d-%H%M).zip"
-          echo "ZIP_FILENAME=$ZIP_FILENAME" >> "$GITHUB_ENV"
-
-          zip -r9 "../$ZIP_FILENAME" . \
-            -x '.git/*' \
-            -x '.git' \
-            -x '.github/*' \
-            -x '.github' \
-            -x 'README.md' \
-            -x '*placeholder*'
-
-          cd ..
-          echo "== ZIP dibuat: $ZIP_FILENAME =="
-          ls -la "$ZIP_FILENAME"
-          echo ""
-          echo "== Isi ZIP =="
-          unzip -l "$ZIP_FILENAME"
 
       # ============================================================
-      # STEP 4: Generate changelog dengan info ReSukiSU + SUSFS
+      # STEP 4: Copy Image ke folder AnyKernel3 (siap upload)
+      # ============================================================
+      - name: 8. Prepare folder AnyKernel3 (siap zip oleh GitHub)
+        run: |
+          cp Image.gz-dtb ak3-build/
+
+          # Set nama artifact (tanpa .zip di akhir, GitHub yang tambah otomatis)
+          ARTIFACT_NAME="${{ github.event.inputs.zip_name }}-$(date -u +%Y%m%d-%H%M)"
+          echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> "$GITHUB_ENV"
+
+          echo "== Isi ak3-build (siap jadi flashable ZIP) =="
+          ls -la ak3-build/
+          echo ""
+          echo "== Struktur folder =="
+          find ak3-build/ -maxdepth 2 -type f | head -20
+          echo ""
+          echo "Artifact name yang akan diupload: $ARTIFACT_NAME"
+          echo "Setelah download dari GitHub, file akan bernama: ${ARTIFACT_NAME}.zip"
+
+      # ============================================================
+      # STEP 5: Generate changelog
       # ============================================================
       - name: 9. Generate Changelog Otomatis
         run: |
-          # Extract dari metadata JSON (nested structure)
+          # Extract dari metadata JSON (nested structure workflow 3)
           if [ -f "build-metadata.json" ]; then
             KERNEL_SOURCE=$(python3 -c "import json; d=json.load(open('build-metadata.json')); print(d.get('kernel',{}).get('source','unknown'))")
             KERNEL_BRANCH=$(python3 -c "import json; d=json.load(open('build-metadata.json')); print(d.get('kernel',{}).get('branch','unknown'))")
@@ -288,6 +280,7 @@ jobs:
 
           **Kernel compile:** ${BUILD_DATE_SRC}
           **ZIP dibuat:** ${ZIP_DATE}
+          **Artifact file:** \`${ARTIFACT_NAME}.zip\`
 
           ---
 
@@ -322,7 +315,7 @@ jobs:
           ## 📱 Manager APK (dipilih: **${MANAGER_NAME}**)
           ${MANAGER_STATUS}
 
-          **Download:** ${MANAGER_RELEASE_URL}
+          **Download Manager APK:** ${MANAGER_RELEASE_URL}
 
           > **Info Manager Compatibility:**
           > ReSukiSU v4.1+ mendukung 5 manager unofficial:
@@ -351,12 +344,12 @@ jobs:
 
           ### Langkah flash:
           1. Reboot ke recovery (TWRP / OrangeFox)
-          2. Flash \`${ZIP_FILENAME}\`
+          2. Flash \`${ARTIFACT_NAME}.zip\`
           3. Wipe Dalvik Cache (opsional, disarankan)
           4. Reboot ke system
           5. Install ${MANAGER_NAME} Manager APK dari link di atas
           6. Buka Manager → verifikasi status **"Working"** / **"Enabled"**
-          7. Buka tab SUSFS → verifikasi versi **v${SUSFS_VERSION}** terdeteksi
+          7. Buka tab SUSFS → verifikasi versi **${SUSFS_VERSION}** terdeteksi
 
           ### Setelah booted:
           - **Configure SUSFS** via Manager (SUS Path, SUS Mount, dll)
@@ -380,13 +373,13 @@ jobs:
           cat CHANGELOG.md
 
       # ============================================================
-      # STEP 5: Upload artifacts (fix double zip)
+      # STEP 6: Upload artifacts (auto-zip oleh GitHub, tanpa double zip)
       # ============================================================
-      - name: 10. Upload Flashable ZIP
+      - name: 10. Upload Flashable ZIP (auto-zip GitHub)
         uses: actions/upload-artifact@v4
         with:
-          name: flashable-${{ github.event.inputs.zip_name }}
-          path: ${{ env.ZIP_FILENAME }}
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ak3-build/**
           retention-days: 30
           if-no-files-found: error
 
@@ -399,7 +392,7 @@ jobs:
           if-no-files-found: warn
 
       # ============================================================
-      # STEP 6: Build summary
+      # STEP 7: Build summary
       # ============================================================
       - name: 12. Generate build summary
         if: always()
@@ -409,7 +402,8 @@ jobs:
 
           | Field | Value |
           |-------|-------|
-          | **ZIP Name** | \`${ZIP_FILENAME}\` |
+          | **Artifact Name** | \`${ARTIFACT_NAME}\` |
+          | **Download File** | \`${ARTIFACT_NAME}.zip\` (langsung flashable) |
           | **Kernel** | BaikalOS 13.0 + ReSukiSU + SUSFS |
           | **Device** | Poco F1 (beryllium) |
           | **Manager** | ${MANAGER_NAME} |
@@ -419,7 +413,9 @@ jobs:
           👉 ${MANAGER_RELEASE_URL}
 
           ## 🚀 Ready to Flash!
-          Download artifact \`flashable-${{ github.event.inputs.zip_name }}\` di atas.
+          1. Download artifact \`${ARTIFACT_NAME}\` di atas
+          2. File yang di-download langsung berupa \`.zip\` yang **flashable** (tidak perlu extract dulu)
+          3. Transfer ke HP → boot ke TWRP → flash
 
           ⚠️ **Sebelum flash**: backup boot.img asli dan uninstall root lama!
           EOF
