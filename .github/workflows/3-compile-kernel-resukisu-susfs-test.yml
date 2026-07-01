@@ -1,0 +1,897 @@
+name: 3. Compile Kernel - BOS Beryllium + ReSukiSU + SUSFS + Log
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_name:
+        description: 'Nama Build'
+        required: true
+        default: 'bos-beryllium-resukisu-susfs'
+      kernel_source:
+        description: 'Kernel Source'
+        required: true
+        default: 'https://github.com/baikalos/android_kernel_xiaomi_sdm845.git'
+      kernel_branch:
+        description: 'Kernel Branch'
+        required: true
+        default: '13.0'
+      defconfig:
+        description: 'defconfig path (di kernel source)'
+        required: true
+        default: 'vendor/xiaomi/mi845_defconfig'
+      use_extracted_config:
+        description: 'Pakai config hasil extract boot.img asli sebagai basis? (true/false)'
+        required: true
+        default: 'true'
+      resukisu_repo:
+        description: 'ReSukiSU repo URL'
+        required: true
+        default: 'https://github.com/ReSukiSU/ReSukiSU'
+      resukisu_branch:
+        description: 'ReSukiSU branch/tag'
+        required: true
+        default: 'main'
+      susfs_repo:
+        description: 'SUSFS repo URL'
+        required: true
+        default: 'https://gitlab.com/simonpunk/susfs4ksu.git'
+      susfs_branch:
+        description: 'SUSFS branch'
+        required: true
+        default: 'kernel-4.9'
+      susfs_patch_url:
+        description: 'SUSFS patch for 4.9 (URL langsung ke .patch file)'
+        required: true
+        default: 'https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/Patch/susfs_patch_to_4.9.patch'
+      clang_url:
+        description: 'Clang prebuilt'
+        required: false
+        default: 'https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-release/clang-r487747c.tar.gz'
+
+jobs:
+  test-build:
+    name: ${{ github.event.inputs.zip_name }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo (untuk akses extracted-config/my_defconfig.txt)
+        uses: actions/checkout@v4
+
+      - name: Show Input
+        run: |
+          echo "kernel_source       : ${{ github.event.inputs.kernel_source }}"
+          echo "kernel_branch       : ${{ github.event.inputs.kernel_branch }}"
+          echo "defconfig           : ${{ github.event.inputs.defconfig }}"
+          echo "use_extracted_config: ${{ github.event.inputs.use_extracted_config }}"
+          echo "resukisu_repo       : ${{ github.event.inputs.resukisu_repo }}"
+          echo "resukisu_branch     : ${{ github.event.inputs.resukisu_branch }}"
+          echo "susfs_repo          : ${{ github.event.inputs.susfs_repo }}"
+          echo "susfs_branch        : ${{ github.event.inputs.susfs_branch }}"
+          echo "susfs_patch_url     : ${{ github.event.inputs.susfs_patch_url }}"
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc build-essential flex bison ca-certificates clang lld llvm \
+            libssl-dev libelf-dev cpio curl git unzip wget python3 python-is-python3 \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            g++-aarch64-linux-gnu g++-arm-linux-gnueabi \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
+            libncurses5-dev libncursesw5-dev patch
+          echo "== Cek lokasi arm-linux-gnueabi-as =="
+          which arm-linux-gnueabi-as || echo "TIDAK DITEMUKAN"
+
+      - name: Setup Clang Cache
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/clang-ext
+          key: clang-${{ github.event.inputs.clang_url }}
+
+      - name: Setup Clang
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/clang-ext
+          curl -Lo clang.tar.gz "${{ github.event.inputs.clang_url }}"
+          tar -xzf clang.tar.gz -C ~/clang-ext
+          rm -f clang.tar.gz
+
+      - name: Add Clang to PATH
+        run: echo "$HOME/clang-ext/bin" >> $GITHUB_PATH
+
+      - name: Clone Kernel Source (BaikalOS)
+        run: |
+          git clone --depth=1 "${{ github.event.inputs.kernel_source }}" -b "${{ github.event.inputs.kernel_branch }}" kernel-src
+
+      # ================================================================
+      # INTEGRASI ReSukiSU (pengganti KernelSU-Next)
+      # ================================================================
+      # ReSukiSU adalah fork KernelSU yang setup.sh-nya kompatibel dengan
+      # pola KernelSU-Next: menjalankan curl | bash -s <tag/branch>.
+      # Hasilnya: direktori KernelSU/ di root kernel + symlink
+      # drivers/kernelsu -> KernelSU/kernel, plus injeksi Kconfig/Makefile.
+      # ================================================================
+      - name: Setup ReSukiSU (pengganti KernelSU-Next)
+        run: |
+          cd kernel-src
+
+          echo "== Mencoba setup.sh dari ReSukiSU =="
+          SETUP_URL="${{ github.event.inputs.resukisu_repo }}"
+          # Konversi URL github ke raw URL untuk setup.sh
+          # https://github.com/ReSukiSU/ReSukiSU -> raw content
+          RAW_BASE="$(echo "$SETUP_URL" | sed 's|github.com|raw.githubusercontent.com|')"
+
+          SETUP_OK=0
+
+          # Cara 1: curl setup.sh langsung (pola sama persis dengan KSU-Next)
+          echo "[Cara 1] curl setup.sh | bash -s ${{ github.event.inputs.resukisu_branch }}"
+          if curl -LSsf "${RAW_BASE}/${{ github.event.inputs.resukisu_branch }}/kernel/setup.sh" \
+              | bash -s "${{ github.event.inputs.resukisu_branch }}"; then
+            echo "[OK] setup.sh via curl berhasil."
+            SETUP_OK=1
+          else
+            echo "[INFO] Cara 1 gagal, coba cara 2..."
+          fi
+
+          # Cara 2: clone repo, jalankan setup.sh lokal
+          if [ "$SETUP_OK" -ne 1 ]; then
+            echo "[Cara 2] Clone ReSukiSU lalu jalankan setup.sh lokal"
+            git clone --depth=1 -b "${{ github.event.inputs.resukisu_branch }}" \
+              "${{ github.event.inputs.resukisu_repo }}" .resukisu-src
+
+            if [ -f .resukisu-src/kernel/setup.sh ]; then
+              bash .resukisu-src/kernel/setup.sh "${{ github.event.inputs.resukisu_branch }}" && SETUP_OK=1
+            fi
+          fi
+
+          # Cara 3: fallback manual — copy driver + patch Makefile/Kconfig sendiri
+          if [ "$SETUP_OK" -ne 1 ]; then
+            echo "[Cara 3] Fallback: integrasi manual"
+            if [ -d .resukisu-src ]; then
+              DRIVER_SRC=".resukisu-src/kernel"
+            else
+              git clone --depth=1 -b "${{ github.event.inputs.resukisu_branch }}" \
+                "${{ github.event.inputs.resukisu_repo }}" .resukisu-src
+              DRIVER_SRC=".resukisu-src/kernel"
+            fi
+
+            # Buat direktori KernelSU/kernel dan copy isinya
+            mkdir -p KernelSU/kernel
+            cp -a "$DRIVER_SRC"/. KernelSU/kernel/ 2>/dev/null || true
+
+            # Buat symlink drivers/kernelsu -> KernelSU/kernel
+            ln -sf "$(pwd)/KernelSU/kernel" drivers/kernelsu
+
+            # Inject ke drivers/Makefile
+            if ! grep -q "kernelsu" drivers/Makefile; then
+              echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+            fi
+
+            # Inject ke drivers/Kconfig
+            if ! grep -q "kernelsu" drivers/Kconfig; then
+              sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+            fi
+
+            SETUP_OK=1
+            echo "[OK] Integrasi manual selesai."
+          fi
+
+          if [ "$SETUP_OK" -ne 1 ]; then
+            echo "[GAGAL] Semua cara integrasi ReSukiSU gagal."
+            exit 1
+          fi
+
+          echo ""
+          echo "== Verifikasi struktur ReSukiSU =="
+          echo "--- drivers/kernelsu ---"
+          ls -la drivers/kernelsu || echo "TIDAK ADA symlink drivers/kernelsu!"
+          echo "--- drivers/Makefile (entri kernelsu) ---"
+          grep -n "kernelsu" drivers/Makefile || echo "TIDAK ADA entri di drivers/Makefile!"
+          echo "--- drivers/Kconfig (entri kernelsu) ---"
+          grep -n "kernelsu" drivers/Kconfig || echo "TIDAK ADA entri di drivers/Kconfig!"
+
+          # Deteksi nama direktori KSU root (untuk metadata nanti)
+          # ReSukiSU bisa bikin "KernelSU" atau "KernelSU-Next" tergantung setup.sh
+          KSU_ROOT_DIR=""
+          for d in KernelSU KernelSU-Next ReSukiSU; do
+            if [ -d "$d" ]; then
+              KSU_ROOT_DIR="$d"
+              break
+            fi
+          done
+          echo "KSU_ROOT_DIR=$KSU_ROOT_DIR" >> "$GITHUB_ENV"
+          echo "Detected KSU root dir: $KSU_ROOT_DIR"
+
+      # ================================================================
+      # MANUAL HOOKS untuk ReSukiSU (non-GKI, kernel 4.9)
+      # ================================================================
+      # Referensi: https://resukisu.github.io/guide/manual-integrate.html
+      #
+      # Non-GKI 4.9 TIDAK punya kprobe yang reliable, jadi kita perlu
+      # manual hook di 5 file kernel. ReSukiSU (dan KernelSU asli)
+      # butuh hook ini supaya bisa intercept syscall.
+      #
+      # Catatan: KSU-Next versi kamu sebelumnya pakai CONFIG_KSU_KPROBE_HOOKS=y
+      # yang bypass manual hook. Tapi ReSukiSU untuk non-GKI 4.9 WAJIB manual hook.
+      # Jadi step ini KRUSIAL.
+      # ================================================================
+      - name: Detect KSU hook header
+        run: |
+          cd kernel-src
+
+          # ReSukiSU / KernelSU bisa naruh header di beberapa lokasi
+          KSU_HEADER=""
+          for candidate in \
+            "linux/ksu.h" \
+            "linux/ksu_hook.h" \
+            "linux/kernelsu.h"; do
+            if [ -f "include/$candidate" ]; then
+              KSU_HEADER="$candidate"
+              break
+            fi
+          done
+
+          # Kalau belum ketemu, cari di driver tree
+          if [ -z "$KSU_HEADER" ]; then
+            FOUND="$(find drivers/kernelsu KernelSU KernelSU-Next .resukisu-src 2>/dev/null \
+                     -type f \( -name 'ksu.h' -o -name 'ksu_hook.h' -o -name 'kernelsu.h' \) \
+                     | head -n 1 || true)"
+            if [ -n "$FOUND" ]; then
+              BASENAME="$(basename "$FOUND")"
+              cp -f "$FOUND" "include/linux/$BASENAME"
+              KSU_HEADER="linux/$BASENAME"
+              echo "[INFO] Header di-copy dari $FOUND -> include/linux/$BASENAME"
+            fi
+          fi
+
+          if [ -z "$KSU_HEADER" ]; then
+            echo "[PERINGATAN] KSU hook header tidak ditemukan."
+            echo "Daftar header di include/linux yang mengandung 'ksu':"
+            find include/linux -iname "*ksu*" -o -iname "*kernelsu*" 2>/dev/null || true
+            echo "Daftar header di driver tree:"
+            find drivers/kernelsu -name "*.h" 2>/dev/null || true
+            echo ""
+            echo "Lanjut dengan fallback 'linux/ksu.h' (mungkin error saat compile, tapi"
+            echo "bisa di-debug dari build log)."
+            KSU_HEADER="linux/ksu.h"
+          fi
+
+          echo "KSU_HEADER=$KSU_HEADER" >> "$GITHUB_ENV"
+          echo "Detected KSU header: $KSU_HEADER"
+
+      - name: Apply ReSukiSU manual hooks (5 file kernel)
+        run: |
+          cd kernel-src
+
+          # Python script untuk patching yang reliable.
+          # Tidak pakai sed karena pattern multi-line & brace matching terlalu fragile.
+          python3 << 'HOOKSCRIPT'
+          import os, re, sys
+          from pathlib import Path
+
+          header = os.environ.get("KSU_HEADER", "linux/ksu.h")
+          print(f"Using KSU header: {header}")
+
+          def add_include(text, hdr):
+              """Tambah #include <header> setelah block #include terakhir, kalau belum ada."""
+              inc_line = f'#include <{hdr}>'
+              if inc_line in text:
+                  return text
+              # Cari posisi #include terakhir
+              matches = list(re.finditer(r'^[ \t]*#include\s+[<"][^>"]+[>"]', text, re.M))
+              if matches:
+                  pos = matches[-1].end()
+                  return text[:pos] + '\n' + inc_line + text[pos:]
+              # Tidak ada #include sama sekali (sangat unlikely), taruh di awal
+              return inc_line + '\n' + text
+
+          def find_func_opening_brace(text, func_patterns):
+              """Cari opening brace '{' dari function yang match salah satu pattern.
+              Return posisi tepat setelah '{' (+ newline kalau ada), atau -1."""
+              for pat in func_patterns:
+                  m = re.search(pat, text, re.S | re.M)
+                  if m:
+                      # Dari titik match, cari '{' pertama
+                      rest = text[m.start():]
+                      brace = rest.find('{')
+                      if brace != -1:
+                          abs_pos = m.start() + brace + 1
+                          # Skip whitespace/newline setelah '{'
+                          while abs_pos < len(text) and text[abs_pos] in (' ', '\t'):
+                              abs_pos += 1
+                          if abs_pos < len(text) and text[abs_pos] == '\n':
+                              abs_pos += 1
+                          return abs_pos, pat
+              return -1, None
+
+          # ---------------------------------------------------------------
+          # Definisi 5 hooks
+          # Setiap entry: (file, [function patterns], hook_code, marker)
+          #
+          # marker dipakai untuk cek idempotency (sudah di-hook atau belum)
+          #
+          # Parameter hook mengikuti variable name di kernel 4.9 BaikalOS/CAF.
+          # Kalau nama variable beda, compiler akan error dan dari build.log
+          # bisa langsung ketahuan variable mana yang salah.
+          # ---------------------------------------------------------------
+          hooks = [
+              # Hook 1: fs/exec.c — intercept execve
+              # Kernel 4.9 CAF/BaikalOS biasanya pakai do_execveat_common()
+              (
+                  "fs/exec.c",
+                  [
+                      r'static\s+int\s+do_execveat_common\s*\(',
+                      r'static\s+int\s+__do_execve_file\s*\(',
+                      r'int\s+do_execve\s*\(',
+                  ],
+                  'ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);',
+                  'ksu_handle_execveat',
+              ),
+              # Hook 2: fs/open.c — intercept faccessat
+              (
+                  "fs/open.c",
+                  [
+                      r'long\s+do_faccessat\s*\(',
+                      r'SYSCALL_DEFINE\d\s*\(\s*faccessat',
+                  ],
+                  'ksu_handle_faccessat(&dfd, &filename, &mode, NULL);',
+                  'ksu_handle_faccessat',
+              ),
+              # Hook 3: fs/read_write.c — intercept vfs_read
+              (
+                  "fs/read_write.c",
+                  [
+                      r'ssize_t\s+vfs_read\s*\(',
+                  ],
+                  'ksu_handle_vfs_read(&file, &buf, &count, &pos);',
+                  'ksu_handle_vfs_read',
+              ),
+              # Hook 4: fs/stat.c — intercept stat
+              # Kernel 4.9: biasanya vfs_fstatat(), bukan vfs_statx()
+              (
+                  "fs/stat.c",
+                  [
+                      r'int\s+vfs_fstatat\s*\(',
+                      r'int\s+vfs_statx\s*\(',
+                      r'SYSCALL_DEFINE\d\s*\(\s*newfstatat',
+                  ],
+                  'ksu_handle_stat(&dfd, &filename, &flags);',
+                  'ksu_handle_stat',
+              ),
+              # Hook 5: drivers/input/input.c — intercept input event
+              # Untuk safety net / boot trigger detection
+              (
+                  "drivers/input/input.c",
+                  [
+                      r'static\s+void\s+input_handle_event\s*\(',
+                      r'void\s+input_handle_event\s*\(',
+                  ],
+                  'ksu_handle_input_handle_event(&type, &code, &value);',
+                  'ksu_handle_input_handle_event',
+              ),
+          ]
+
+          results = []
+          for filepath, func_pats, hook_code, marker in hooks:
+              p = Path(filepath)
+              if not p.exists():
+                  results.append((filepath, "SKIP", "file not found"))
+                  continue
+
+              text = p.read_text(encoding='utf-8', errors='replace')
+
+              # Cek idempotency
+              if marker in text:
+                  results.append((filepath, "OK", "already hooked"))
+                  continue
+
+              # Tambah #include
+              text = add_include(text, header)
+
+              # Cari function & inject hook
+              pos, matched_pat = find_func_opening_brace(text, func_pats)
+              if pos == -1:
+                  results.append((filepath, "WARN", "function pattern not matched"))
+                  # Tetap tulis file (karena mungkin sudah ada #include yang ditambahkan)
+                  p.write_text(text, encoding='utf-8')
+                  continue
+
+              # Inject hook code
+              indent = '\t'
+              hook_block = f'{indent}/* ReSukiSU hook */\n{indent}{hook_code}\n'
+              text = text[:pos] + hook_block + text[pos:]
+
+              p.write_text(text, encoding='utf-8')
+              results.append((filepath, "OK", f"hooked via pattern: {matched_pat[:60]}..."))
+
+          # Print summary
+          print("\n" + "=" * 60)
+          print("HOOK SUMMARY")
+          print("=" * 60)
+          all_ok = True
+          for filepath, status, detail in results:
+              icon = {"OK": "✓", "WARN": "⚠", "SKIP": "⊘"}.get(status, "?")
+              print(f"  {icon} [{status:4s}] {filepath}: {detail}")
+              if status not in ("OK",):
+                  all_ok = False
+
+          if not all_ok:
+              print("\n[PERINGATAN] Beberapa hook tidak berhasil di-inject.")
+              print("Build mungkin tetap jalan, tapi fitur KSU bisa tidak berfungsi penuh.")
+              print("Cek build log untuk error terkait ksu_handle_* yang undefined.")
+          print("")
+          HOOKSCRIPT
+
+          echo ""
+          echo "== Verifikasi grep ksu_handle di source =="
+          for f in fs/exec.c fs/open.c fs/read_write.c fs/stat.c drivers/input/input.c; do
+            if [ -f "$f" ]; then
+              MATCHES=$(grep -c "ksu_handle" "$f" 2>/dev/null || echo "0")
+              echo "  $f: $MATCHES hook call(s)"
+            fi
+          done
+
+      # ================================================================
+      # INTEGRASI SUSFS
+      # ================================================================
+      # SUSFS (sus_su filesystem) menyembunyikan mount, path, stat, dll
+      # dari deteksi root. Untuk kernel 4.9, butuh:
+      # 1. Clone susfs4ksu branch kernel-4.9
+      # 2. Copy file SUSFS (header + source) ke kernel tree
+      # 3. Apply patch yang meng-hook SUSFS ke KernelSU driver
+      # ================================================================
+      - name: Integrate SUSFS (kernel-4.9)
+        run: |
+          cd kernel-src
+          set -e
+
+          echo "== Clone SUSFS repo (branch: ${{ github.event.inputs.susfs_branch }}) =="
+          git clone --depth=1 -b "${{ github.event.inputs.susfs_branch }}" \
+            "${{ github.event.inputs.susfs_repo }}" .susfs4ksu
+
+          echo ""
+          echo "== Struktur SUSFS repo =="
+          find .susfs4ksu -maxdepth 3 -type f | head -40
+
+          echo ""
+          echo "== Copy SUSFS kernel source files =="
+
+          # SUSFS repo untuk kernel-4.9 biasanya punya struktur:
+          #   kernel_patches/
+          #     fs/           -> file susfs source (susfs.c, susfs_*.c)
+          #     include/      -> header (linux/susfs.h, linux/susfs_*.h)
+          #     KernelSU/     -> patch untuk integrasi ke KernelSU driver
+          #   atau langsung:
+          #   fs/susfs/
+          #   include/linux/
+
+          # Strategy: copy semua yang cocok, lalu apply patch
+
+          # 1) Copy header files
+          if [ -d ".susfs4ksu/kernel_patches/include/linux" ]; then
+            cp -vf .susfs4ksu/kernel_patches/include/linux/susfs*.h include/linux/ 2>/dev/null || true
+            echo "[OK] Copied SUSFS headers from kernel_patches/include/linux/"
+          fi
+          if [ -d ".susfs4ksu/include/linux" ]; then
+            cp -vf .susfs4ksu/include/linux/susfs*.h include/linux/ 2>/dev/null || true
+            echo "[OK] Copied SUSFS headers from include/linux/"
+          fi
+
+          # 2) Copy source files ke fs/
+          if [ -d ".susfs4ksu/kernel_patches/fs" ]; then
+            # Bisa berupa fs/susfs.c langsung atau fs/susfs/ directory
+            for item in .susfs4ksu/kernel_patches/fs/*; do
+              if [ -d "$item" ]; then
+                DIRNAME=$(basename "$item")
+                mkdir -p "fs/$DIRNAME"
+                cp -rvf "$item"/* "fs/$DIRNAME/" 2>/dev/null || true
+              elif [ -f "$item" ]; then
+                cp -vf "$item" fs/ 2>/dev/null || true
+              fi
+            done
+            echo "[OK] Copied SUSFS source from kernel_patches/fs/"
+          fi
+          if [ -d ".susfs4ksu/fs/susfs" ]; then
+            mkdir -p fs/susfs
+            cp -rvf .susfs4ksu/fs/susfs/* fs/susfs/ 2>/dev/null || true
+            echo "[OK] Copied SUSFS source from fs/susfs/"
+          fi
+
+          # 3) Copy patches yang ada di dalam SUSFS repo
+          echo ""
+          echo "== Apply SUSFS patches dari dalam repo (jika ada) =="
+          PATCH_COUNT=0
+          for pdir in \
+            ".susfs4ksu/kernel_patches/KernelSU" \
+            ".susfs4ksu/kernel_patches/patches" \
+            ".susfs4ksu/kernel_patches" \
+            ".susfs4ksu/patches"; do
+            if [ -d "$pdir" ]; then
+              for pf in "$pdir"/*.patch; do
+                [ -f "$pf" ] || continue
+                echo "  Applying: $pf"
+                if git apply --check "$pf" 2>/dev/null; then
+                  git apply "$pf"
+                  echo "    [OK] git apply"
+                  PATCH_COUNT=$((PATCH_COUNT + 1))
+                else
+                  if patch -p1 --forward --fuzz=3 --no-backup-if-mismatch < "$pf" 2>&1; then
+                    echo "    [OK] patch -p1"
+                    PATCH_COUNT=$((PATCH_COUNT + 1))
+                  else
+                    echo "    [WARN] Patch gagal (mungkin sudah ter-apply atau conflict)"
+                  fi
+                fi
+              done
+            fi
+          done
+          echo "Patches dari repo SUSFS yang berhasil: $PATCH_COUNT"
+
+          # 4) Apply external SUSFS patch (dari input susfs_patch_url)
+          echo ""
+          echo "== Download & apply SUSFS patch eksternal =="
+          echo "URL: ${{ github.event.inputs.susfs_patch_url }}"
+
+          if curl -LSsf "${{ github.event.inputs.susfs_patch_url }}" -o /tmp/susfs_ext.patch; then
+            echo "Patch file downloaded, size: $(wc -c < /tmp/susfs_ext.patch) bytes"
+            echo "Preview (20 baris pertama):"
+            head -20 /tmp/susfs_ext.patch
+            echo "..."
+
+            if git apply --check /tmp/susfs_ext.patch 2>/dev/null; then
+              git apply /tmp/susfs_ext.patch
+              echo "[OK] SUSFS external patch applied (git apply)"
+            else
+              echo "git apply --check gagal, coba patch -p1..."
+              if patch -p1 --forward --no-backup-if-mismatch < /tmp/susfs_ext.patch 2>&1; then
+                echo "[OK] SUSFS external patch applied (patch -p1)"
+              else
+                echo "patch -p1 strict gagal, coba --fuzz=3..."
+                if patch -p1 --forward --fuzz=3 --no-backup-if-mismatch < /tmp/susfs_ext.patch 2>&1; then
+                  echo "[OK] SUSFS external patch applied (patch -p1 --fuzz=3)"
+                else
+                  echo "[WARN] SUSFS external patch gagal apply."
+                  echo "Coba --force (partial apply)..."
+                  patch -p1 --forward --fuzz=3 --force --no-backup-if-mismatch < /tmp/susfs_ext.patch 2>&1 || true
+                  echo "[INFO] Partial apply selesai. Cek build log untuk error."
+                fi
+              fi
+            fi
+          else
+            echo "[WARN] Gagal download SUSFS external patch dari URL."
+            echo "Build tetap lanjut — SUSFS mungkin sudah ter-integrate dari patches repo."
+          fi
+
+          echo ""
+          echo "== SUSFS files di kernel tree (final) =="
+          find . -type f -name "*susfs*" -not -path "./.susfs4ksu/*" | sort
+          echo ""
+          echo "== SUSFS config di Kconfig (jika ada) =="
+          grep -rn "SUSFS\|susfs" drivers/kernelsu/Kconfig 2>/dev/null || \
+          grep -rn "SUSFS\|susfs" KernelSU/kernel/Kconfig 2>/dev/null || \
+          echo "(tidak ditemukan di Kconfig KernelSU — mungkin patch belum masuk)"
+
+      # ================================================================
+      # PREPARE DEFCONFIG
+      # ================================================================
+      - name: Prepare defconfig (extracted config + ReSukiSU + SUSFS flags)
+        run: |
+          cd kernel-src
+
+          DEFCONFIG_PATH="arch/arm64/configs/${{ github.event.inputs.defconfig }}"
+
+          if [ ! -f "$DEFCONFIG_PATH" ]; then
+            echo "ERROR: defconfig tidak ditemukan di $DEFCONFIG_PATH"
+            echo "Mencari kemungkinan path defconfig lain:"
+            find arch/arm64/configs -iname "*845*" -o -iname "*beryllium*" -o -iname "*xiaomi*" 2>/dev/null
+            exit 1
+          fi
+
+          # Timpa dengan extracted config dari boot.img (kalau diminta)
+          if [ "${{ github.event.inputs.use_extracted_config }}" = "true" ]; then
+            EXTRACTED_CFG="$GITHUB_WORKSPACE/extracted-config/my_defconfig.txt"
+            if [ -f "$EXTRACTED_CFG" ]; then
+              echo "[INFO] Memakai config hasil extract boot.img asli sebagai basis (menimpa $DEFCONFIG_PATH)."
+              cp "$EXTRACTED_CFG" "$DEFCONFIG_PATH"
+            else
+              echo "[PERINGATAN] use_extracted_config=true tapi file $EXTRACTED_CFG tidak ditemukan di repo."
+              echo "Pastikan kamu sudah commit file extracted config ke path 'extracted-config/my_defconfig.txt' di repo ini."
+              echo "Lanjut pakai defconfig asli dari source kernel sebagai fallback."
+            fi
+          fi
+
+          # Bersihkan CONFIG_KSU / SUSFS lama yang mungkin sudah ada di extracted config
+          # (karena extracted config dari BaikalOS stock biasanya TIDAK ada KSU)
+          sed -i '/^CONFIG_KSU/d; /^# CONFIG_KSU is not set/d' "$DEFCONFIG_PATH"
+          sed -i '/SUSFS/d' "$DEFCONFIG_PATH"
+
+          # Tambahkan config ReSukiSU + SUSFS
+          # CATATAN PENTING:
+          # - Untuk non-GKI 4.9, kita TIDAK pakai CONFIG_KSU_KPROBE_HOOKS=y
+          #   karena kprobe pada kernel 4.9 tidak reliable.
+          #   Sebagai gantinya kita sudah apply manual hooks di step sebelumnya.
+          # - CONFIG_KPROBES dan CONFIG_KPROBE_EVENTS tetap diaktifkan karena
+          #   ada bagian lain di KSU yang mungkin membutuhkannya.
+          {
+            echo ""
+            echo "# === ReSukiSU ==="
+            echo "CONFIG_KSU=y"
+            echo "CONFIG_KPROBES=y"
+            echo "CONFIG_KPROBE_EVENTS=y"
+            echo ""
+            echo "# === SUSFS ==="
+            echo "CONFIG_KSU_SUSFS=y"
+            echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
+            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y"
+            echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
+            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
+            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
+            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_SU=y"
+            echo ""
+            echo "# === Filesystem support (dibutuhkan KSU & SUSFS) ==="
+            echo "CONFIG_OVERLAY_FS=y"
+            echo "CONFIG_TMPFS_XATTR=y"
+            echo "CONFIG_TMPFS_POSIX_ACL=y"
+          } >> "$DEFCONFIG_PATH"
+
+          echo "[OK] Defconfig $DEFCONFIG_PATH berhasil dipatch dengan opsi ReSukiSU + SUSFS."
+          echo ""
+          echo "== KSU/SUSFS entries di defconfig =="
+          grep -E "CONFIG_KSU|CONFIG_KPROBES|SUSFS|OVERLAY" "$DEFCONFIG_PATH" | sort
+
+      # ================================================================
+      # PATCH VDSO32 & SKIP BROKEN DTB (sama persis dengan workflow KSU-Next)
+      # ================================================================
+      - name: Patch arch/arm64/Makefile (fix clang vdso32 "-EL" assembler error)
+        run: |
+          cd kernel-src
+          MAIN_MK="arch/arm64/Makefile"
+
+          if [ ! -f "$MAIN_MK" ]; then
+            echo "ERROR: $MAIN_MK tidak ditemukan!"
+            exit 1
+          fi
+
+          echo "== Cari blok CLANG_PREFIX32 / GCC_TOOLCHAIN32 di $MAIN_MK =="
+          grep -n "CLANG_PREFIX32\|GCC_TOOLCHAIN32\|CLANG_TARGET_ARM32\|CLANG_GCC32_TC" "$MAIN_MK" || echo "TIDAK DITEMUKAN sama sekali!"
+
+          cp "$MAIN_MK" "$MAIN_MK.orig"
+
+          sed -i -E \
+            's@(CLANG_PREFIX32[[:space:]]*:=[[:space:]]*--prefix=\$\(GCC_TOOLCHAIN32_DIR\))[[:space:]]*$@\1$(notdir $(CROSS_COMPILE_ARM32))@' \
+            "$MAIN_MK"
+
+          if ! diff -q "$MAIN_MK" "$MAIN_MK.orig" > /dev/null; then
+            echo "[OK] Patch CLANG_PREFIX32 berhasil diterapkan."
+            echo "== Baris setelah patch =="
+            grep -n "CLANG_PREFIX32" "$MAIN_MK"
+          else
+            echo "[PERINGATAN] Pattern CLANG_PREFIX32 tidak match/tidak berubah."
+            echo "Menampilkan 15 baris di sekitar definisi CLANG_PREFIX32 untuk diperiksa manual:"
+            grep -n -B5 -A10 "CLANG_TARGET_ARM32\|CLANG_PREFIX32" "$MAIN_MK" || true
+          fi
+
+          rm -f "$MAIN_MK.orig"
+
+      - name: Skip DTB yang tidak relevan/rusak (QVR headset, interposer SDM670)
+        run: |
+          cd kernel-src
+          DTS_MK="arch/arm64/boot/dts/qcom/Makefile"
+
+          if [ ! -f "$DTS_MK" ]; then
+            echo "PERINGATAN: $DTS_MK tidak ditemukan, skip step ini."
+            exit 0
+          fi
+
+          BROKEN_DTBS=(
+            "sdm845-v2-qvr-evt.dtb"
+            "sdm845-v2-qvr-dvt.dtb"
+            "sdm845-interposer-sdm670-mtp.dtb"
+            "sdm845-interposer-sdm670-cdp.dtb"
+          )
+
+          cp "$DTS_MK" "$DTS_MK.orig"
+
+          for dtb in "${BROKEN_DTBS[@]}"; do
+            if grep -q "$dtb" "$DTS_MK"; then
+              sed -i "/$dtb/d" "$DTS_MK"
+              echo "[OK] Baris untuk $dtb dihapus dari $DTS_MK."
+            else
+              echo "[INFO] $dtb tidak ditemukan di $DTS_MK (mungkin sudah tidak ada / nama beda)."
+            fi
+          done
+
+          echo "== Diff perubahan =="
+          diff "$DTS_MK.orig" "$DTS_MK" || true
+
+          rm -f "$DTS_MK.orig"
+
+      # ================================================================
+      # COMPILE KERNEL
+      # ================================================================
+      - name: Compile Kernel (test build, tidak untuk flash)
+        env:
+          KBUILD_BUILD_USER: "tester"
+          KBUILD_BUILD_HOST: "ghactions"
+        run: |
+          cd kernel-src
+          OUT_DIR="out"
+          export PATH="$HOME/clang-ext/bin:$PATH"
+
+          MAKE_ARGS=(
+            O=$OUT_DIR
+            ARCH=arm64
+            CC=clang
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+            READELF=llvm-readelf
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            LLVM=1
+            LLVM_IAS=1
+          )
+
+          mkdir -p $OUT_DIR
+          make "${MAKE_ARGS[@]}" ${{ github.event.inputs.defconfig }}
+          make "${MAKE_ARGS[@]}" olddefconfig
+
+          echo "== Cek config KSU + SUSFS di .config hasil olddefconfig =="
+          for cfg in \
+            CONFIG_KSU \
+            CONFIG_KPROBES \
+            CONFIG_KPROBE_EVENTS \
+            CONFIG_KSU_SUSFS \
+            CONFIG_KSU_SUSFS_SUS_PATH \
+            CONFIG_KSU_SUSFS_SUS_MOUNT \
+            CONFIG_KSU_SUSFS_SUS_KSTAT \
+            CONFIG_KSU_SUSFS_SUS_OVERLAYFS \
+            CONFIG_KSU_SUSFS_TRY_UMOUNT \
+            CONFIG_KSU_SUSFS_SPOOF_UNAME \
+            CONFIG_KSU_SUSFS_ENABLE_LOG \
+            CONFIG_KSU_SUSFS_OPEN_REDIRECT \
+            CONFIG_KSU_SUSFS_SUS_SU \
+            CONFIG_OVERLAY_FS; do
+            VAL=$(grep "^${cfg}=" $OUT_DIR/.config 2>/dev/null || echo "NOT SET")
+            echo "  $cfg = $VAL"
+          done
+
+          if ! grep -q '^CONFIG_KSU=y' $OUT_DIR/.config; then
+            echo ""
+            echo "FATAL: CONFIG_KSU=y tidak aktif di .config final!"
+            echo "Berarti Kconfig dari driver ReSukiSU tidak ter-load."
+            echo "Cek apakah drivers/kernelsu/Kconfig ada dan benar."
+            exit 1
+          fi
+
+          # -k (keep going): jangan berhenti total kalau satu target dtb gagal
+          set +e
+          make -k -j$(nproc --all) "${MAKE_ARGS[@]}" 2>&1 | tee build.log
+          BUILD_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          echo "== Exit code make: $BUILD_EXIT =="
+          echo "== Cek apakah Image / Image.gz-dtb berhasil dihasilkan =="
+          IMAGE_OK=0
+          IMAGE_GZ_DTB_OK=0
+
+          if [ -f "$OUT_DIR/arch/arm64/boot/Image" ]; then
+            ls -la "$OUT_DIR/arch/arm64/boot/Image"
+            IMAGE_OK=1
+          else
+            echo "Image TIDAK ADA"
+          fi
+
+          if [ -f "$OUT_DIR/arch/arm64/boot/Image.gz-dtb" ]; then
+            ls -la "$OUT_DIR/arch/arm64/boot/Image.gz-dtb"
+            IMAGE_GZ_DTB_OK=1
+          else
+            echo "Image.gz-dtb TIDAK ADA"
+          fi
+
+          if [ "$IMAGE_GZ_DTB_OK" -eq 1 ]; then
+            echo "[OK] Image.gz-dtb berhasil dihasilkan lengkap (kernel + dtb beryllium). Ini yang dipakai untuk flash."
+            BUILD_OK=1
+          elif [ "$IMAGE_OK" -eq 1 ]; then
+            echo "[SEBAGIAN OK] Image (vmlinux mentah) berhasil, tapi Image.gz-dtb belum ada."
+            echo "Kemungkinan target dtbs masih gagal di tempat lain."
+            BUILD_OK=1
+          else
+            echo "[GAGAL] Baik Image maupun Image.gz-dtb tidak ditemukan. Build benar-benar gagal."
+            BUILD_OK=0
+          fi
+
+          echo "BUILD_OK=$BUILD_OK" >> "$GITHUB_ENV"
+          if [ "$BUILD_OK" -ne 1 ]; then
+            exit 1
+          fi
+
+      # ================================================================
+      # METADATA & ARTIFACTS (sama polanya dengan workflow KSU-Next)
+      # ================================================================
+      - name: Capture Build Metadata (untuk changelog otomatis)
+        if: env.BUILD_OK == '1'
+        run: |
+          cd kernel-src
+
+          KERNEL_COMMIT=$(git rev-parse --short HEAD)
+          KERNEL_COMMIT_FULL=$(git rev-parse HEAD)
+
+          # ReSukiSU bisa di KernelSU/, KernelSU-Next/, atau di-embed langsung
+          KSU_DIR="${{ env.KSU_ROOT_DIR }}"
+          if [ -n "$KSU_DIR" ] && [ -d "$KSU_DIR" ]; then
+            KSU_COMMIT=$(cd "$KSU_DIR" && git rev-parse --short HEAD 2>/dev/null || echo "embedded")
+          else
+            KSU_COMMIT="unknown"
+          fi
+
+          SUSFS_COMMIT="unknown"
+          if [ -d ".susfs4ksu" ]; then
+            SUSFS_COMMIT=$(cd .susfs4ksu && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+          fi
+
+          KERNEL_VERSION_STRING=$(cat out/include/config/kernel.release 2>/dev/null || echo unknown)
+          BUILD_DATE=$(date -u '+%Y-%m-%d %H:%M UTC')
+
+          cat > ../build-metadata.json << JSONEOF
+          {
+            "build_date": "${BUILD_DATE}",
+            "kernel_source": "${{ github.event.inputs.kernel_source }}",
+            "kernel_branch": "${{ github.event.inputs.kernel_branch }}",
+            "kernel_commit": "${KERNEL_COMMIT}",
+            "kernel_commit_full": "${KERNEL_COMMIT_FULL}",
+            "root_solution": "ReSukiSU + SUSFS",
+            "resukisu_repo": "${{ github.event.inputs.resukisu_repo }}",
+            "resukisu_branch": "${{ github.event.inputs.resukisu_branch }}",
+            "resukisu_commit": "${KSU_COMMIT}",
+            "susfs_repo": "${{ github.event.inputs.susfs_repo }}",
+            "susfs_branch": "${{ github.event.inputs.susfs_branch }}",
+            "susfs_commit": "${SUSFS_COMMIT}",
+            "susfs_patch_url": "${{ github.event.inputs.susfs_patch_url }}",
+            "kernel_version_string": "${KERNEL_VERSION_STRING}",
+            "defconfig": "${{ github.event.inputs.defconfig }}",
+            "use_extracted_config": "${{ github.event.inputs.use_extracted_config }}",
+            "clang_url": "${{ github.event.inputs.clang_url }}",
+            "zip_name": "${{ github.event.inputs.zip_name }}"
+          }
+          JSONEOF
+
+          echo "== Isi build-metadata.json =="
+          cat ../build-metadata.json
+
+      - name: Upload Build Metadata
+        if: env.BUILD_OK == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-metadata
+          path: build-metadata.json
+          if-no-files-found: warn
+
+      - name: Upload Build Log (selalu, untuk debug)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: kernel-src/build.log
+          if-no-files-found: warn
+
+      - name: Upload Image.gz-dtb
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.zip_name }}-gz-dtb
+          path: kernel-src/out/arch/arm64/boot/Image.gz-dtb
+          if-no-files-found: ignore
+
+      - name: Upload Image Only
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.zip_name }}-raw
+          path: kernel-src/out/arch/arm64/boot/Image
+          if-no-files-found: ignore
