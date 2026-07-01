@@ -596,6 +596,43 @@ jobs:
             echo "  $f -> ${HOOKS:-NONE}"
           done
 
+      - name: Fix - Hapus vfs_read hook (tidak ada di ReSukiSU)
+        run: |
+          cd kernel-src
+
+          # Hapus 2 baris: comment + call ksu_handle_vfs_read
+          if [ -f fs/read_write.c ] && grep -q "ksu_handle_vfs_read" fs/read_write.c; then
+            python3 << 'PYEOF'
+          from pathlib import Path
+          p = Path("fs/read_write.c")
+          lines = p.read_text().split('\n')
+          new_lines = []
+          i = 0
+          removed = False
+          while i < len(lines):
+              line = lines[i]
+              # Cek kalau baris ini adalah call ksu_handle_vfs_read
+              if 'ksu_handle_vfs_read' in line and not removed:
+                  # Cek baris sebelumnya (comment ReSukiSU hook)
+                  if new_lines and 'ReSukiSU hook' in new_lines[-1]:
+                      new_lines.pop()  # hapus comment
+                  print(f"[OK] Removed vfs_read hook at line {i+1}: {line.strip()}")
+                  removed = True
+                  i += 1
+                  continue
+              new_lines.append(line)
+              i += 1
+
+          p.write_text('\n'.join(new_lines))
+          if not removed:
+              print("[SKIP] vfs_read hook not found")
+          PYEOF
+          fi
+
+          echo ""
+          echo "== Verifikasi fs/read_write.c hooks =="
+          grep -n "ksu_handle" fs/read_write.c | head -10
+
       - name: Prepare defconfig
         run: |
           cd kernel-src
