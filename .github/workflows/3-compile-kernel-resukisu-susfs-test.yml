@@ -147,16 +147,6 @@ jobs:
           done
           echo "KSU_ROOT_DIR=$KSU_ROOT_DIR" >> "$GITHUB_ENV"
 
-      # ==========================================================
-      # SUSFS: strategi simplify
-      # ==========================================================
-      # 1. Clone SUSFS repo
-      # 2. Apply patch dengan --fuzz=3 --force (hunk yg bisa apply akan apply)
-      # 3. Hapus .rej files (kita tidak butuh, hunks yg gagal akan di-handle
-      #    lewat compile error → fix pakai sed simple)
-      # 4. Copy sus_su.c (tidak dicover patch)
-      # 5. JANGAN copy susfs.c / susfs.h duluan — biarkan patch yg create
-      # ==========================================================
       - name: Integrate SUSFS
         run: |
           cd kernel-src
@@ -181,20 +171,16 @@ jobs:
           grep -c "FAILED" /tmp/susfs.log || echo "0"
           echo ""
           echo "-- FAILED details --"
-          grep "FAILED\|hunks ignored\|hunks FAILED" /tmp/susfs.log || echo "(none)"
+          grep "FAILED" /tmp/susfs.log || echo "(none)"
 
-          # Cleanup: hapus .rej dan .orig
           find . -name "*.rej" -not -path "./.susfs4ksu/*" -delete 2>/dev/null || true
           find . -name "*.orig" -not -path "./.susfs4ksu/*" -delete 2>/dev/null || true
 
           echo ""
-          echo "== [3/3] Copy sus_su.c (tidak dicover patch) =="
+          echo "== [3/3] Copy sus_su.c dan file SUSFS yg belum ada =="
           if [ ! -f fs/sus_su.c ] && [ -f .susfs4ksu/kernel_patches/fs/sus_su.c ]; then
             cp -v .susfs4ksu/kernel_patches/fs/sus_su.c fs/sus_su.c
           fi
-
-          # Kalau susfs.c / susfs.h TIDAK ada (karena patch gagal create),
-          # copy manual sebagai fallback
           if [ ! -f fs/susfs.c ] && [ -f .susfs4ksu/kernel_patches/fs/susfs.c ]; then
             cp -v .susfs4ksu/kernel_patches/fs/susfs.c fs/susfs.c
           fi
@@ -209,60 +195,35 @@ jobs:
           echo "== SUSFS files final =="
           ls -la fs/susfs.c fs/sus_su.c include/linux/susfs.h include/linux/susfs_def.h 2>/dev/null || true
 
-      # ==========================================================
-      # Manual sed fixes untuk hunks yang gagal apply
-      # ==========================================================
-      # Berdasarkan dry-run log sebelumnya, ini file yang butuh manual fix:
-      # - fs/proc_namespace.c: butuh #include <linux/susfs.h>
-      # - fs/stat.c: butuh #include <linux/susfs.h>
-      # - fs/proc/cmdline.c: butuh #include (kalau ada logic tambahan biarkan gagal)
-      # - fs/Makefile: butuh entry obj-y untuk susfs.o dan sus_su.o
-      # ==========================================================
-      - name: Fix SUSFS missing includes (simple sed patches)
+      - name: Fix SUSFS missing includes
         run: |
           cd kernel-src
 
-          # Fix 1: fs/Makefile - tambah obj-y untuk susfs.o dan sus_su.o
           if [ -f fs/Makefile ]; then
             if ! grep -q "susfs.o" fs/Makefile; then
-              # Sisipkan setelah baris pertama yang punya "obj-y +="
               sed -i '0,/^obj-y[[:space:]]*+=/{s|^obj-y[[:space:]]*+=.*|&\nobj-y += susfs.o sus_su.o|}' fs/Makefile
               echo "[OK] Added susfs.o sus_su.o to fs/Makefile"
-            else
-              echo "[SKIP] fs/Makefile already has susfs.o"
             fi
           fi
 
-          # Fix 2: fs/proc_namespace.c - tambah include
-          if [ -f fs/proc_namespace.c ]; then
-            if ! grep -q "linux/susfs" fs/proc_namespace.c; then
-              sed -i '/^#include <linux\/fs\.h>/a #include <linux/susfs.h>\n#include <linux/susfs_def.h>' fs/proc_namespace.c
-              echo "[OK] Added susfs includes to fs/proc_namespace.c"
-            fi
+          if [ -f fs/proc_namespace.c ] && ! grep -q "linux/susfs" fs/proc_namespace.c; then
+            sed -i '/^#include <linux\/fs\.h>/a #include <linux/susfs.h>\n#include <linux/susfs_def.h>' fs/proc_namespace.c
+            echo "[OK] Added susfs includes to fs/proc_namespace.c"
           fi
 
-          # Fix 3: fs/stat.c - tambah include
-          if [ -f fs/stat.c ]; then
-            if ! grep -q "linux/susfs" fs/stat.c; then
-              sed -i '/^#include <linux\/fs\.h>/a #include <linux/susfs.h>\n#include <linux/susfs_def.h>' fs/stat.c
-              echo "[OK] Added susfs includes to fs/stat.c"
-            fi
+          if [ -f fs/stat.c ] && ! grep -q "linux/susfs" fs/stat.c; then
+            sed -i '/^#include <linux\/fs\.h>/a #include <linux/susfs.h>\n#include <linux/susfs_def.h>' fs/stat.c
+            echo "[OK] Added susfs includes to fs/stat.c"
           fi
 
-          # Fix 4: fs/proc/cmdline.c - tambah include
-          if [ -f fs/proc/cmdline.c ]; then
-            if ! grep -q "linux/susfs" fs/proc/cmdline.c; then
-              sed -i '/^#include <linux\/fs\.h>/a #include <linux/susfs.h>' fs/proc/cmdline.c
-              echo "[OK] Added susfs include to fs/proc/cmdline.c"
-            fi
+          if [ -f fs/proc/cmdline.c ] && ! grep -q "linux/susfs" fs/proc/cmdline.c; then
+            sed -i '/^#include <linux\/fs\.h>/a #include <linux/susfs.h>' fs/proc/cmdline.c
+            echo "[OK] Added susfs include to fs/proc/cmdline.c"
           fi
 
-          # Fix 5: fs/proc/task_mmu.c - tambah include
-          if [ -f fs/proc/task_mmu.c ]; then
-            if ! grep -q "linux/susfs" fs/proc/task_mmu.c; then
-              sed -i '/^#include <linux\/fs\.h>/a #include <linux/susfs.h>\n#include <linux/susfs_def.h>' fs/proc/task_mmu.c
-              echo "[OK] Added susfs includes to fs/proc/task_mmu.c"
-            fi
+          if [ -f fs/proc/task_mmu.c ] && ! grep -q "linux/susfs" fs/proc/task_mmu.c; then
+            sed -i '/^#include <linux\/fs\.h>/a #include <linux/susfs.h>\n#include <linux/susfs_def.h>' fs/proc/task_mmu.c
+            echo "[OK] Added susfs includes to fs/proc/task_mmu.c"
           fi
 
           echo ""
@@ -305,95 +266,86 @@ jobs:
           echo "[FATAL] Header ksu_hook.h tidak ditemukan"
           exit 1
 
-      # ==========================================================
-      # Manual hooks pakai sed (bukan Python heredoc)
-      # 6 hooks wajib untuk non-GKI 4.9 + ReSukiSU v4.1+
-      # ==========================================================
       - name: Apply ReSukiSU manual hooks
         run: |
           cd kernel-src
           KSU_HEADER="${{ env.KSU_HEADER }}"
           echo "Using header: $KSU_HEADER"
 
-          # Helper function untuk tambah include
+          # Helper: tambah include header ke file
           add_include() {
             local file="$1"
-            if [ -f "$file" ]; then
-              if ! grep -q "linux/version.h" "$file"; then
-                sed -i '0,/^#include/{s|^#include|#include <linux/version.h>\n&|}' "$file"
-              fi
-              if ! grep -q "$KSU_HEADER" "$file"; then
-                sed -i "0,/^#include/{s|^#include|#include <$KSU_HEADER>\n&|}" "$file"
-              fi
+            if [ ! -f "$file" ]; then return; fi
+            if ! grep -q "linux/version.h" "$file"; then
+              sed -i '0,/^#include/s||#include <linux/version.h>\n&|' "$file"
+            fi
+            if ! grep -q "$KSU_HEADER" "$file"; then
+              sed -i "0,/^#include/s||#include <$KSU_HEADER>\n&|" "$file"
             fi
           }
 
-          # Hook 1: fs/exec.c
+          # Helper: inject hook setelah opening brace fungsi
+          # Args: $1=file, $2=pattern function, $3=hook code
+          inject_hook() {
+            local file="$1"
+            local func_pat="$2"
+            local hook_code="$3"
+            if [ ! -f "$file" ]; then return; fi
+
+            # Buat awk script yang cari pattern function lalu inject setelah "{"
+            awk -v pat="$func_pat" -v hook="$hook_code" '
+              $0 ~ pat { found=1 }
+              found && /^\{/ && !injected {
+                print
+                print "\t/* ReSukiSU hook */"
+                print "\t" hook
+                injected=1
+                found=0
+                next
+              }
+              { print }
+            ' "$file" > "$file.new" && mv "$file.new" "$file"
+          }
+
+          # Hook 1: fs/exec.c -> ksu_handle_execveat
           add_include fs/exec.c
           if [ -f fs/exec.c ] && ! grep -q "ksu_handle_execveat" fs/exec.c; then
-            # Cari do_execveat_common dan inject setelah opening brace
-            sed -i '/^static int do_execveat_common/,/^{/{ /^{/a\
-	/* ReSukiSU hook */\
-	ksu_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);
-            }' fs/exec.c
+            inject_hook fs/exec.c "static int do_execveat_common" "ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);"
             echo "[OK] Hooked fs/exec.c"
           fi
 
-          # Hook 2: fs/open.c
+          # Hook 2: fs/open.c -> ksu_handle_faccessat
           add_include fs/open.c
           if [ -f fs/open.c ] && ! grep -q "ksu_handle_faccessat" fs/open.c; then
-            sed -i '/^long do_faccessat/,/^{/{ /^{/a\
-	/* ReSukiSU hook */\
-	ksu_handle_faccessat(\&dfd, \&filename, \&mode, NULL);
-            }' fs/open.c
+            inject_hook fs/open.c "long do_faccessat" "ksu_handle_faccessat(&dfd, &filename, &mode, NULL);"
             echo "[OK] Hooked fs/open.c"
           fi
 
-          # Hook 3: fs/read_write.c
+          # Hook 3: fs/read_write.c -> ksu_handle_vfs_read
           add_include fs/read_write.c
           if [ -f fs/read_write.c ] && ! grep -q "ksu_handle_vfs_read" fs/read_write.c; then
-            sed -i '/^ssize_t vfs_read/,/^{/{ /^{/a\
-	/* ReSukiSU hook */\
-	ksu_handle_vfs_read(\&file, \&buf, \&count, \&pos);
-            }' fs/read_write.c
+            inject_hook fs/read_write.c "ssize_t vfs_read" "ksu_handle_vfs_read(&file, &buf, &count, &pos);"
             echo "[OK] Hooked fs/read_write.c"
           fi
 
-          # Hook 4: fs/stat.c (PENTING: pakai &flag bukan &flags)
+          # Hook 4: fs/stat.c -> ksu_handle_stat (PENTING: flag bukan flags)
           add_include fs/stat.c
           if [ -f fs/stat.c ] && ! grep -q "ksu_handle_stat" fs/stat.c; then
-            sed -i '/^int vfs_fstatat/,/^{/{ /^{/a\
-	/* ReSukiSU hook */\
-	ksu_handle_stat(\&dfd, \&filename, \&flag);
-            }' fs/stat.c
+            inject_hook fs/stat.c "int vfs_fstatat" "ksu_handle_stat(&dfd, &filename, &flag);"
             echo "[OK] Hooked fs/stat.c"
           fi
 
-          # Hook 5: drivers/input/input.c
+          # Hook 5: drivers/input/input.c -> ksu_handle_input_handle_event
           add_include drivers/input/input.c
           if [ -f drivers/input/input.c ] && ! grep -q "ksu_handle_input_handle_event" drivers/input/input.c; then
-            sed -i '/^void input_handle_event/,/^{/{ /^{/a\
-	/* ReSukiSU hook */\
-	ksu_handle_input_handle_event(\&type, \&code, \&value);
-            }' drivers/input/input.c
-            # Fallback kalau function-nya static
-            if ! grep -q "ksu_handle_input_handle_event" drivers/input/input.c; then
-              sed -i '/^static void input_handle_event/,/^{/{ /^{/a\
-	/* ReSukiSU hook */\
-	ksu_handle_input_handle_event(\&type, \&code, \&value);
-              }' drivers/input/input.c
-            fi
+            inject_hook drivers/input/input.c "void input_handle_event" "ksu_handle_input_handle_event(&type, &code, &value);"
             echo "[OK] Hooked drivers/input/input.c"
           fi
 
-          # Hook 6: kernel/sys.c (setresuid) - WAJIB ReSukiSU v4.1+
+          # Hook 6: kernel/sys.c -> ksu_handle_setresuid (WAJIB ReSukiSU v4.1+)
           add_include kernel/sys.c
           if [ -f kernel/sys.c ] && ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
-            # Cari SYSCALL_DEFINE3(setresuid,...) dan inject setelah brace
-            sed -i '/^SYSCALL_DEFINE3(setresuid/,/^{/{ /^{/a\
-	/* ReSukiSU hook */\
-	ksu_handle_setresuid(\&ruid, \&euid, \&suid);
-            }' kernel/sys.c
+            inject_hook kernel/sys.c "SYSCALL_DEFINE3.setresuid" "ksu_handle_setresuid(&ruid, &euid, &suid);"
             echo "[OK] Hooked kernel/sys.c"
           fi
 
@@ -429,33 +381,28 @@ jobs:
           sed -i '/SUSFS/d' "$DEFCONFIG_PATH"
           sed -i '/^CONFIG_KSU_KPROBE_HOOKS/d' "$DEFCONFIG_PATH"
 
-          cat >> "$DEFCONFIG_PATH" << 'EOFCFG'
-
-          # === ReSukiSU ===
-          CONFIG_KSU=y
-          CONFIG_KPROBES=y
-          CONFIG_KPROBE_EVENTS=y
-
-          # === SUSFS ===
-          CONFIG_KSU_SUSFS=y
-          CONFIG_KSU_SUSFS_SUS_PATH=y
-          CONFIG_KSU_SUSFS_SUS_MOUNT=y
-          CONFIG_KSU_SUSFS_SUS_KSTAT=y
-          CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y
-          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
-          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
-          CONFIG_KSU_SUSFS_ENABLE_LOG=y
-          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
-          CONFIG_KSU_SUSFS_SUS_SU=y
-
-          # === Filesystem ===
-          CONFIG_OVERLAY_FS=y
-          CONFIG_TMPFS_XATTR=y
-          CONFIG_TMPFS_POSIX_ACL=y
-          EOFCFG
-
-          # Bersihkan indentasi dari heredoc
-          sed -i 's/^          //' "$DEFCONFIG_PATH"
+          echo "" >> "$DEFCONFIG_PATH"
+          echo "# === ReSukiSU ===" >> "$DEFCONFIG_PATH"
+          echo "CONFIG_KSU=y" >> "$DEFCONFIG_PATH"
+          echo "CONFIG_KPROBES=y" >> "$DEFCONFIG_PATH"
+          echo "CONFIG_KPROBE_EVENTS=y" >> "$DEFCONFIG_PATH"
+          echo "" >> "$DEFCONFIG_PATH"
+          echo "# === SUSFS ===" >> "$DEFCONFIG_PATH"
+          echo "CONFIG_KSU_SUSFS=y" >> "$DEFCONFIG_PATH"
+          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$DEFCONFIG_PATH"
+          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$DEFCONFIG_PATH"
+          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$DEFCONFIG_PATH"
+          echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y" >> "$DEFCONFIG_PATH"
+          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "$DEFCONFIG_PATH"
+          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$DEFCONFIG_PATH"
+          echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "$DEFCONFIG_PATH"
+          echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "$DEFCONFIG_PATH"
+          echo "CONFIG_KSU_SUSFS_SUS_SU=y" >> "$DEFCONFIG_PATH"
+          echo "" >> "$DEFCONFIG_PATH"
+          echo "# === Filesystem ===" >> "$DEFCONFIG_PATH"
+          echo "CONFIG_OVERLAY_FS=y" >> "$DEFCONFIG_PATH"
+          echo "CONFIG_TMPFS_XATTR=y" >> "$DEFCONFIG_PATH"
+          echo "CONFIG_TMPFS_POSIX_ACL=y" >> "$DEFCONFIG_PATH"
 
           echo "== KSU/SUSFS entries =="
           grep -E "CONFIG_KSU|CONFIG_KPROBES|SUSFS|OVERLAY" "$DEFCONFIG_PATH" | sort
@@ -465,7 +412,6 @@ jobs:
           cd kernel-src
           MAIN_MK="arch/arm64/Makefile"
           [ -f "$MAIN_MK" ] || exit 1
-
           sed -i -E 's@(CLANG_PREFIX32[[:space:]]*:=[[:space:]]*--prefix=\$\(GCC_TOOLCHAIN32_DIR\))[[:space:]]*$@\1$(notdir $(CROSS_COMPILE_ARM32))@' "$MAIN_MK"
           grep -n "CLANG_PREFIX32" "$MAIN_MK" || true
 
@@ -554,21 +500,19 @@ jobs:
           KERNEL_VERSION_STRING=$(cat out/include/config/kernel.release 2>/dev/null || echo unknown)
           BUILD_DATE=$(date -u '+%Y-%m-%d %H:%M UTC')
 
-          cat > ../build-metadata.json << JSONEOF
-          {
-            "build_date": "${BUILD_DATE}",
-            "kernel_branch": "${{ github.event.inputs.kernel_branch }}",
-            "kernel_commit": "${KERNEL_COMMIT}",
-            "root_solution": "ReSukiSU + SUSFS",
-            "resukisu_branch": "${{ github.event.inputs.resukisu_branch }}",
-            "resukisu_commit": "${KSU_COMMIT}",
-            "susfs_branch": "${{ github.event.inputs.susfs_branch }}",
-            "susfs_commit": "${SUSFS_COMMIT}",
-            "kernel_version": "${KERNEL_VERSION_STRING}",
-            "defconfig": "${{ github.event.inputs.defconfig }}",
-            "zip_name": "${{ github.event.inputs.zip_name }}"
-          }
-          JSONEOF
+          echo "{" > ../build-metadata.json
+          echo "  \"build_date\": \"${BUILD_DATE}\"," >> ../build-metadata.json
+          echo "  \"kernel_branch\": \"${{ github.event.inputs.kernel_branch }}\"," >> ../build-metadata.json
+          echo "  \"kernel_commit\": \"${KERNEL_COMMIT}\"," >> ../build-metadata.json
+          echo "  \"root_solution\": \"ReSukiSU + SUSFS\"," >> ../build-metadata.json
+          echo "  \"resukisu_branch\": \"${{ github.event.inputs.resukisu_branch }}\"," >> ../build-metadata.json
+          echo "  \"resukisu_commit\": \"${KSU_COMMIT}\"," >> ../build-metadata.json
+          echo "  \"susfs_branch\": \"${{ github.event.inputs.susfs_branch }}\"," >> ../build-metadata.json
+          echo "  \"susfs_commit\": \"${SUSFS_COMMIT}\"," >> ../build-metadata.json
+          echo "  \"kernel_version\": \"${KERNEL_VERSION_STRING}\"," >> ../build-metadata.json
+          echo "  \"defconfig\": \"${{ github.event.inputs.defconfig }}\"," >> ../build-metadata.json
+          echo "  \"zip_name\": \"${{ github.event.inputs.zip_name }}\"" >> ../build-metadata.json
+          echo "}" >> ../build-metadata.json
           cat ../build-metadata.json
 
       - name: Upload Build Metadata
