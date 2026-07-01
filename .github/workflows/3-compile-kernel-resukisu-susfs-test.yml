@@ -54,7 +54,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
 
-      - name: Checkout repo (untuk akses extracted-config/my_defconfig.txt)
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Show Input
@@ -63,11 +63,8 @@ jobs:
           echo "kernel_branch       : ${{ github.event.inputs.kernel_branch }}"
           echo "defconfig           : ${{ github.event.inputs.defconfig }}"
           echo "use_extracted_config: ${{ github.event.inputs.use_extracted_config }}"
-          echo "resukisu_repo       : ${{ github.event.inputs.resukisu_repo }}"
           echo "resukisu_branch     : ${{ github.event.inputs.resukisu_branch }}"
-          echo "susfs_repo          : ${{ github.event.inputs.susfs_repo }}"
           echo "susfs_branch        : ${{ github.event.inputs.susfs_branch }}"
-          echo "susfs_patch_url     : ${{ github.event.inputs.susfs_patch_url }}"
 
       - name: Install Build Dependencies
         run: |
@@ -79,7 +76,6 @@ jobs:
             g++-aarch64-linux-gnu g++-arm-linux-gnueabi \
             binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
             libncurses5-dev libncursesw5-dev patch
-          which arm-linux-gnueabi-as || echo "arm-linux-gnueabi-as TIDAK DITEMUKAN"
 
       - name: Setup Clang Cache
         id: clang-cache
@@ -106,776 +102,383 @@ jobs:
             -b "${{ github.event.inputs.kernel_branch }}" \
             kernel-src
 
-      # ============================================================
-      # STEP: Setup ReSukiSU
-      # ============================================================
       - name: Setup ReSukiSU
         run: |
           cd kernel-src
-
-          RAW_BASE="$(echo "${{ github.event.inputs.resukisu_repo }}" \
-            | sed 's|github.com|raw.githubusercontent.com|')"
+          RAW_BASE="$(echo "${{ github.event.inputs.resukisu_repo }}" | sed 's|github.com|raw.githubusercontent.com|')"
           SETUP_OK=0
 
-          echo "[Cara 1] curl setup.sh | bash -s ${{ github.event.inputs.resukisu_branch }}"
-          if curl -LSsf \
-              "${RAW_BASE}/${{ github.event.inputs.resukisu_branch }}/kernel/setup.sh" \
-              | bash -s "${{ github.event.inputs.resukisu_branch }}"; then
-            echo "[OK] setup.sh via curl berhasil."
+          echo "[Cara 1] curl setup.sh"
+          if curl -LSsf "${RAW_BASE}/${{ github.event.inputs.resukisu_branch }}/kernel/setup.sh" | bash -s "${{ github.event.inputs.resukisu_branch }}"; then
             SETUP_OK=1
-          else
-            echo "[INFO] Cara 1 gagal, coba cara 2..."
           fi
 
           if [ "$SETUP_OK" -ne 1 ]; then
-            echo "[Cara 2] Clone ReSukiSU lalu jalankan setup.sh lokal"
+            echo "[Cara 2] Clone lokal"
             git clone --depth=1 -b "${{ github.event.inputs.resukisu_branch }}" \
               "${{ github.event.inputs.resukisu_repo }}" .resukisu-src
             if [ -f .resukisu-src/kernel/setup.sh ]; then
-              bash .resukisu-src/kernel/setup.sh \
-                "${{ github.event.inputs.resukisu_branch }}" && SETUP_OK=1 || true
+              bash .resukisu-src/kernel/setup.sh "${{ github.event.inputs.resukisu_branch }}" && SETUP_OK=1 || true
             fi
           fi
 
           if [ "$SETUP_OK" -ne 1 ]; then
-            echo "[Cara 3] Fallback: integrasi manual"
-            [ -d .resukisu-src ] || git clone --depth=1 \
-              -b "${{ github.event.inputs.resukisu_branch }}" \
+            echo "[Cara 3] Fallback manual"
+            [ -d .resukisu-src ] || git clone --depth=1 -b "${{ github.event.inputs.resukisu_branch }}" \
               "${{ github.event.inputs.resukisu_repo }}" .resukisu-src
-
             mkdir -p KernelSU/kernel
             cp -a .resukisu-src/kernel/. KernelSU/kernel/ 2>/dev/null || true
             ln -sf "$(pwd)/KernelSU/kernel" drivers/kernelsu
-
-            grep -q "kernelsu" drivers/Makefile || \
-              echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
-            grep -q "kernelsu" drivers/Kconfig || \
-              sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-
+            grep -q "kernelsu" drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+            grep -q "kernelsu" drivers/Kconfig || sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
             SETUP_OK=1
-            echo "[OK] Integrasi manual selesai."
           fi
 
-          [ "$SETUP_OK" -eq 1 ] || { echo "[GAGAL] Semua cara ReSukiSU gagal."; exit 1; }
+          [ "$SETUP_OK" -eq 1 ] || { echo "GAGAL setup ReSukiSU"; exit 1; }
 
-          echo "== Verifikasi struktur ReSukiSU =="
-          ls -la drivers/kernelsu || echo "TIDAK ADA symlink drivers/kernelsu!"
-          grep -n "kernelsu" drivers/Makefile || echo "TIDAK ADA entri di drivers/Makefile!"
-          grep -n "kernelsu" drivers/Kconfig  || echo "TIDAK ADA entri di drivers/Kconfig!"
+          echo "== Verifikasi =="
+          ls -la drivers/kernelsu || true
+          grep -n "kernelsu" drivers/Makefile || true
+          grep -n "kernelsu" drivers/Kconfig || true
 
           KSU_ROOT_DIR=""
           for d in KernelSU KernelSU-Next ReSukiSU; do
             [ -d "$d" ] && { KSU_ROOT_DIR="$d"; break; }
           done
           echo "KSU_ROOT_DIR=$KSU_ROOT_DIR" >> "$GITHUB_ENV"
-          echo "KSU root dir: $KSU_ROOT_DIR"
 
-      # ============================================================
-      # STEP: Integrate SUSFS
-      # ============================================================
-      # PENTING — urutan ini krusial:
-      #
-      # 1. Jangan copy susfs.c / susfs.h / susfs_def.h dulu ke kernel tree
-      #    sebelum apply patch. Patch sudah include hunk "create new file"
-      #    untuk file-file itu. Kalau file sudah ada duluan, patch error
-      #    "already exists in working directory".
-      #
-      # 2. Apply patch dengan patch -p1 --fuzz=3 (bukan git apply).
-      #    Dari dry-run terbukti hampir semua hunk bisa apply dengan fuzz/offset,
-      #    kecuali beberapa hunk di file yang memang beda signifikan
-      #    (fs/proc/cmdline.c, fs/stat.c, fs/proc/task_mmu.c,
-      #    fs/proc_namespace.c). Hunk yang gagal itu akan di-handle manual
-      #    di step berikutnya.
-      #
-      # 3. File yang copy dari repo SUSFS (sus_su.c) tidak di-cover patch,
-      #    jadi tetap perlu di-copy manual, tapi SETELAH patch apply.
-      # ============================================================
+      # ==========================================================
+      # SUSFS: strategi simplify
+      # ==========================================================
+      # 1. Clone SUSFS repo
+      # 2. Apply patch dengan --fuzz=3 --force (hunk yg bisa apply akan apply)
+      # 3. Hapus .rej files (kita tidak butuh, hunks yg gagal akan di-handle
+      #    lewat compile error → fix pakai sed simple)
+      # 4. Copy sus_su.c (tidak dicover patch)
+      # 5. JANGAN copy susfs.c / susfs.h duluan — biarkan patch yg create
+      # ==========================================================
       - name: Integrate SUSFS
         run: |
           cd kernel-src
           set -e
 
-          echo "== [1/4] Clone SUSFS repo =="
+          echo "== [1/3] Clone SUSFS repo =="
           git clone --depth=1 -b "${{ github.event.inputs.susfs_branch }}" \
             "${{ github.event.inputs.susfs_repo }}" .susfs4ksu
 
-          echo ""
-          echo "== Struktur SUSFS repo =="
-          find .susfs4ksu/kernel_patches -type f | sort | head -40
-
-          echo ""
-          echo "== [2/4] Download SUSFS patch =="
+          echo "== [2/3] Download & apply SUSFS patch =="
           curl -LSsf "${{ github.event.inputs.susfs_patch_url }}" -o /tmp/susfs.patch
-          echo "  Size : $(wc -c < /tmp/susfs.patch) bytes"
-          echo "  Lines: $(wc -l < /tmp/susfs.patch)"
+          echo "Patch size: $(wc -c < /tmp/susfs.patch) bytes"
 
-          echo ""
-          echo "== [3/4] Apply SUSFS patch =="
-          # Pakai patch -p1 --fuzz=3
-          # Dari dry-run terbukti majority hunk bisa apply dengan fuzz/offset.
-          # Beberapa hunk yang FAILED akan di-handle manual di step berikutnya.
-          # --force: jangan stop total karena beberapa hunk fail,
-          #          tapi bukan "paksa tempel konten salah" — hunk yang fail
-          #          akan menghasilkan .rej file yang bisa kita analisis.
           set +e
-          patch -p1 --fuzz=3 --no-backup-if-mismatch --force \
-            < /tmp/susfs.patch 2>&1 | tee /tmp/susfs_apply.log
-          PATCH_EXIT=$?
+          patch -p1 --fuzz=3 --no-backup-if-mismatch --force < /tmp/susfs.patch 2>&1 | tee /tmp/susfs.log
           set -e
 
           echo ""
-          echo "Patch exit code: $PATCH_EXIT"
-
-          # Tampilkan ringkasan: mana yang sukses, mana yang failed
-          echo "== Ringkasan patch apply =="
-          grep -E "^(Hunk|checking|FAILED|succeeded|patching)" /tmp/susfs_apply.log \
-            | grep -v "succeeded" | head -30 || true
-          echo "-- Hunks yang berhasil --"
-          grep "succeeded" /tmp/susfs_apply.log | wc -l || true
-          echo "-- Hunks yang FAILED --"
-          grep "FAILED" /tmp/susfs_apply.log | wc -l || true
-
-          # Tampilkan .rej files (hunk yang gagal) untuk keperluan debug
-          REJ_FILES="$(find . -name "*.rej" -not -path "./.susfs4ksu/*" 2>/dev/null | sort)"
-          if [ -n "$REJ_FILES" ]; then
-            echo ""
-            echo "== .rej files (hunk yang gagal apply) =="
-            echo "$REJ_FILES"
-          fi
-
+          echo "-- Hunks succeeded --"
+          grep -c "succeeded" /tmp/susfs.log || echo "0"
+          echo "-- Hunks FAILED --"
+          grep -c "FAILED" /tmp/susfs.log || echo "0"
           echo ""
-          echo "== [4/4] Copy file SUSFS yang tidak dicakup patch =="
-          # sus_su.c tidak di-create oleh patch, perlu copy manual
-          if [ ! -f fs/sus_su.c ] && [ -f .susfs4ksu/kernel_patches/fs/sus_su.c ]; then
-            cp -v .susfs4ksu/kernel_patches/fs/sus_su.c fs/sus_su.c
-            echo "[OK] Copied sus_su.c"
-          fi
+          echo "-- FAILED details --"
+          grep "FAILED\|hunks ignored\|hunks FAILED" /tmp/susfs.log || echo "(none)"
 
-          echo ""
-          echo "== SUSFS files di kernel tree =="
-          find . -type f -name "*susfs*" -o -name "sus_su.c" \
-            | grep -v ".susfs4ksu" | sort
-
-      # ============================================================
-      # STEP: Manual fix untuk hunk SUSFS yang gagal apply
-      # ============================================================
-      # Dari dry-run log, hunk yang benar-benar FAILED di BaikalOS 13.0:
-      #
-      # fs/proc/cmdline.c   → 2/2 hunks FAILED (file ini beda signifikan)
-      # fs/proc/task_mmu.c  → 2/10 hunks FAILED (hunk #3 dan #4)
-      # fs/proc_namespace.c → 1/4 hunks FAILED (hunk #1)
-      # fs/stat.c           → 2/3 hunks FAILED (hunk #2 dan #3)
-      # fs/Makefile         → bisa dengan fuzz (harusnya sudah ok)
-      # fs/readdir.c        → semua ok dengan offset (harusnya sudah ok)
-      #
-      # Kita fix manual dengan Python (lebih reliable daripada sed untuk
-      # multi-line context).
-      # ============================================================
-      - name: Fix SUSFS hunks yang gagal apply (manual patch)
-        run: |
-          cd kernel-src
-
-          python3 << 'FIXPY'
-          import re
-          from pathlib import Path
-
-          results = []
-
-          # ==========================================================
-          # Fix 1: fs/Makefile
-          # ==========================================================
-          # Hunk: tambah sus_su.o dan susfs.o ke obj-y
-          # Patch mencari konteks "obj-y += ..." di Makefile
-          # ==========================================================
-          p = Path("fs/Makefile")
-          if p.exists():
-              text = p.read_text()
-              changed = False
-
-              if "sus_su.o" not in text:
-                  # Cari baris obj-y += ... yang ada di area awal Makefile
-                  # dan tambahkan entry SUSFS
-                  # Pattern: cari baris yang ada "proc.o" atau akhir dari
-                  # blok obj-y di area filesystem core
-                  if "susfs.o" not in text:
-                      # Tambahkan setelah baris pertama yang ada "obj-y +="
-                      text = re.sub(
-                          r'(obj-y\s*\+=\s*[^\n]+\n)',
-                          r'\1obj-y += susfs.o sus_su.o\n',
-                          text,
-                          count=1
-                      )
-                      changed = True
-                      results.append(("fs/Makefile", "OK", "added susfs.o sus_su.o"))
-
-              if not changed:
-                  results.append(("fs/Makefile", "OK", "already has susfs entries or not needed"))
-          else:
-              results.append(("fs/Makefile", "SKIP", "file not found"))
-
-          # ==========================================================
-          # Fix 2: fs/proc/cmdline.c
-          # ==========================================================
-          # 2/2 hunks FAILED — file ini di BaikalOS berbeda dari referensi patch.
-          # Patch mencoba menambahkan susfs_spoof_cmdline_or_bootconfig().
-          # Kita cek isi file dan apply secara manual.
-          # ==========================================================
-          p = Path("fs/proc/cmdline.c")
-          if p.exists():
-              text = p.read_text()
-              changed = False
-
-              # Tambah include susfs.h kalau belum ada
-              if "susfs.h" not in text and "susfs" not in text:
-                  text = re.sub(
-                      r'(#include\s+<linux/fs\.h>)',
-                      r'\1\n#include <linux/susfs.h>\n#include <linux/susfs_def.h>',
-                      text,
-                      count=1
-                  )
-                  # Tambahkan logika susfs spoof cmdline
-                  # Cari fungsi cmdline_proc_show atau proc_cmdline_show
-                  # dan tambahkan susfs hook
-                  hook = '''
-\t/* SUSFS: spoof cmdline */
-\tif (susfs_spoof_cmdline_or_bootconfig(m))
-\t\treturn 0;
-'''
-                  # Inject setelah opening brace dari show function
-                  for func in ['cmdline_proc_show', 'proc_cmdline_show']:
-                      pat = rf'(static\s+int\s+{func}\s*\([^)]*\)\s*\{{)'
-                      m = re.search(pat, text, re.S)
-                      if m:
-                          pos = m.end()
-                          if '\n' == text[pos:pos+1]:
-                              pos += 1
-                          text = text[:pos] + hook + text[pos:]
-                          changed = True
-                          results.append(("fs/proc/cmdline.c", "OK",
-                              f"injected susfs hook into {func}"))
-                          break
-
-              if not changed:
-                  if "susfs" in text:
-                      results.append(("fs/proc/cmdline.c", "OK", "already patched"))
-                  else:
-                      results.append(("fs/proc/cmdline.c", "SKIP",
-                          "function not found, needs manual check"))
-
-              p.write_text(text)
-          else:
-              results.append(("fs/proc/cmdline.c", "SKIP", "file not found"))
-
-          # ==========================================================
-          # Fix 3: fs/proc/task_mmu.c — hunk #3 dan #4
-          # ==========================================================
-          # Hunk #3 (at 387) dan #4 (at 403) yang fail.
-          # Dari patch context, ini tentang menambahkan
-          # spoofed_redirected_name handling di show_map_vma().
-          # ==========================================================
-          p = Path("fs/proc/task_mmu.c")
-          if p.exists():
-              text = p.read_text()
-
-              # Cek apakah sudah ada (mungkin hunk lain sudah berhasil apply)
-              if "spoofed_redirected_name" not in text:
-                  # Cari show_map_vma function dan area yang menampilkan
-                  # nama file mapping
-                  # Patch mencoba inject ke area yang print filename
-                  hook_code = '''
-\t\tchar *spoofed_redirected_name = NULL;
-\t\tsusfs_sus_path_get_redirected_name(file, &spoofed_redirected_name);
-\t\tif (spoofed_redirected_name) {
-\t\t\tseq_puts(m, spoofed_redirected_name);
-\t\t\tkfree(spoofed_redirected_name);
-\t\t} else {
-'''
-                  # Cari pattern: seq_file_path atau show_map_vma
-                  # dan tambahkan hook di area print filename
-                  # Ini complex, cukup catat sebagai warning
-                  results.append(("fs/proc/task_mmu.c", "WARN",
-                      "spoofed_redirected_name not found, needs fuzz patch"))
-              else:
-                  results.append(("fs/proc/task_mmu.c", "OK", "already patched"))
-          else:
-              results.append(("fs/proc/task_mmu.c", "SKIP", "file not found"))
-
-          # ==========================================================
-          # Fix 4: fs/proc_namespace.c — hunk #1
-          # ==========================================================
-          # Hunk #1 FAILED at line 11.
-          # Dari patch, ini tentang menambahkan #include <linux/susfs.h>
-          # dan/atau susfs_hide_sus_mnts_for_non_su_procs handling.
-          # ==========================================================
-          p = Path("fs/proc_namespace.c")
-          if p.exists():
-              text = p.read_text()
-              changed = False
-
-              # Tambah include susfs kalau belum ada
-              if "susfs.h" not in text:
-                  # Cari include terakhir dan tambahkan setelahnya
-                  matches = list(re.finditer(
-                      r'^#include\s+[<"][^>"]+[>"]', text, re.M))
-                  if matches:
-                      pos = matches[-1].end()
-                      text = (text[:pos]
-                              + '\n#include <linux/susfs.h>'
-                              + '\n#include <linux/susfs_def.h>'
-                              + text[pos:])
-                      changed = True
-
-              if changed:
-                  p.write_text(text)
-                  results.append(("fs/proc_namespace.c", "OK",
-                      "added susfs includes (hunk #1 fix)"))
-              else:
-                  results.append(("fs/proc_namespace.c", "OK",
-                      "already has susfs includes"))
-          else:
-              results.append(("fs/proc_namespace.c", "SKIP", "file not found"))
-
-          # ==========================================================
-          # Fix 5: fs/stat.c — hunk #2 dan #3
-          # ==========================================================
-          # Hunk #1 succeed (fuzz), tapi hunk #2 (at 46) dan #3 (at 77) fail.
-          # Patch mencoba inject susfs_sus_kstat_spoof ke generic_fillattr
-          # dan vfs_getattr_nosec.
-          # ==========================================================
-          p = Path("fs/stat.c")
-          if p.exists():
-              text = p.read_text()
-              changed = False
-
-              # Tambah include kalau belum ada
-              if "susfs.h" not in text:
-                  matches = list(re.finditer(
-                      r'^#include\s+[<"][^>"]+[>"]', text, re.M))
-                  if matches:
-                      pos = matches[-1].end()
-                      text = (text[:pos]
-                              + '\n#include <linux/susfs.h>'
-                              + '\n#include <linux/susfs_def.h>'
-                              + text[pos:])
-                      changed = True
-
-              # Inject susfs_sus_kstat_spoof_generic_fillattr ke
-              # generic_fillattr jika belum ada
-              if "susfs_sus_kstat_spoof_generic_fillattr" not in text:
-                  # Cari generic_fillattr
-                  m = re.search(
-                      r'(void\s+generic_fillattr\s*\([^)]*\)\s*\{[^}]*?)'
-                      r'(stat->dev\s*=)',
-                      text, re.S)
-                  if m:
-                      insert_pos = m.start(2)
-                      hook = ('\t/* SUSFS: spoof kstat */\n'
-                              '\tsusfs_sus_kstat_spoof_generic_fillattr'
-                              '(inode, stat);\n\n\t')
-                      text = text[:insert_pos] + hook + text[insert_pos:]
-                      changed = True
-                      results.append(("fs/stat.c", "OK",
-                          "injected susfs_sus_kstat_spoof_generic_fillattr"))
-
-              if changed:
-                  p.write_text(text)
-                  if ("fs/stat.c", "OK", "injected susfs_sus_kstat_spoof_generic_fillattr") \
-                          not in results:
-                      results.append(("fs/stat.c", "OK", "added includes"))
-              else:
-                  if "susfs" in text:
-                      results.append(("fs/stat.c", "OK", "already patched"))
-                  else:
-                      results.append(("fs/stat.c", "WARN",
-                          "no change applied, check manually"))
-          else:
-              results.append(("fs/stat.c", "SKIP", "file not found"))
-
-          # ==========================================================
-          # Print summary
-          # ==========================================================
-          print("=" * 65)
-          print("MANUAL FIX SUMMARY")
-          print("=" * 65)
-          for fp, status, detail in results:
-              icon = {"OK": "✓", "WARN": "⚠", "SKIP": "⊘"}.get(status, "?")
-              print(f"  {icon} [{status:4s}] {fp}")
-              print(f"          → {detail}")
-          print()
-          FIXPY
-
-          # Hapus .rej files (sudah kita handle manual)
+          # Cleanup: hapus .rej dan .orig
           find . -name "*.rej" -not -path "./.susfs4ksu/*" -delete 2>/dev/null || true
           find . -name "*.orig" -not -path "./.susfs4ksu/*" -delete 2>/dev/null || true
 
           echo ""
-          echo "== Verifikasi SUSFS di kernel tree setelah fix =="
-          for f in \
-            fs/susfs.c \
-            fs/sus_su.c \
-            include/linux/susfs.h \
-            include/linux/susfs_def.h \
-            fs/stat.c \
-            fs/proc_namespace.c \
-            fs/proc/cmdline.c; do
-            if [ -f "$f" ]; then
-              HAS_SUSFS=$(grep -c "susfs" "$f" 2>/dev/null || echo "0")
-              echo "  $f: $HAS_SUSFS susfs reference(s)"
+          echo "== [3/3] Copy sus_su.c (tidak dicover patch) =="
+          if [ ! -f fs/sus_su.c ] && [ -f .susfs4ksu/kernel_patches/fs/sus_su.c ]; then
+            cp -v .susfs4ksu/kernel_patches/fs/sus_su.c fs/sus_su.c
+          fi
+
+          # Kalau susfs.c / susfs.h TIDAK ada (karena patch gagal create),
+          # copy manual sebagai fallback
+          if [ ! -f fs/susfs.c ] && [ -f .susfs4ksu/kernel_patches/fs/susfs.c ]; then
+            cp -v .susfs4ksu/kernel_patches/fs/susfs.c fs/susfs.c
+          fi
+          if [ ! -f include/linux/susfs.h ] && [ -f .susfs4ksu/kernel_patches/include/linux/susfs.h ]; then
+            cp -v .susfs4ksu/kernel_patches/include/linux/susfs.h include/linux/susfs.h
+          fi
+          if [ ! -f include/linux/susfs_def.h ] && [ -f .susfs4ksu/kernel_patches/include/linux/susfs_def.h ]; then
+            cp -v .susfs4ksu/kernel_patches/include/linux/susfs_def.h include/linux/susfs_def.h
+          fi
+
+          echo ""
+          echo "== SUSFS files final =="
+          ls -la fs/susfs.c fs/sus_su.c include/linux/susfs.h include/linux/susfs_def.h 2>/dev/null || true
+
+      # ==========================================================
+      # Manual sed fixes untuk hunks yang gagal apply
+      # ==========================================================
+      # Berdasarkan dry-run log sebelumnya, ini file yang butuh manual fix:
+      # - fs/proc_namespace.c: butuh #include <linux/susfs.h>
+      # - fs/stat.c: butuh #include <linux/susfs.h>
+      # - fs/proc/cmdline.c: butuh #include (kalau ada logic tambahan biarkan gagal)
+      # - fs/Makefile: butuh entry obj-y untuk susfs.o dan sus_su.o
+      # ==========================================================
+      - name: Fix SUSFS missing includes (simple sed patches)
+        run: |
+          cd kernel-src
+
+          # Fix 1: fs/Makefile - tambah obj-y untuk susfs.o dan sus_su.o
+          if [ -f fs/Makefile ]; then
+            if ! grep -q "susfs.o" fs/Makefile; then
+              # Sisipkan setelah baris pertama yang punya "obj-y +="
+              sed -i '0,/^obj-y[[:space:]]*+=/{s|^obj-y[[:space:]]*+=.*|&\nobj-y += susfs.o sus_su.o|}' fs/Makefile
+              echo "[OK] Added susfs.o sus_su.o to fs/Makefile"
             else
-              echo "  $f: NOT FOUND"
+              echo "[SKIP] fs/Makefile already has susfs.o"
+            fi
+          fi
+
+          # Fix 2: fs/proc_namespace.c - tambah include
+          if [ -f fs/proc_namespace.c ]; then
+            if ! grep -q "linux/susfs" fs/proc_namespace.c; then
+              sed -i '/^#include <linux\/fs\.h>/a #include <linux/susfs.h>\n#include <linux/susfs_def.h>' fs/proc_namespace.c
+              echo "[OK] Added susfs includes to fs/proc_namespace.c"
+            fi
+          fi
+
+          # Fix 3: fs/stat.c - tambah include
+          if [ -f fs/stat.c ]; then
+            if ! grep -q "linux/susfs" fs/stat.c; then
+              sed -i '/^#include <linux\/fs\.h>/a #include <linux/susfs.h>\n#include <linux/susfs_def.h>' fs/stat.c
+              echo "[OK] Added susfs includes to fs/stat.c"
+            fi
+          fi
+
+          # Fix 4: fs/proc/cmdline.c - tambah include
+          if [ -f fs/proc/cmdline.c ]; then
+            if ! grep -q "linux/susfs" fs/proc/cmdline.c; then
+              sed -i '/^#include <linux\/fs\.h>/a #include <linux/susfs.h>' fs/proc/cmdline.c
+              echo "[OK] Added susfs include to fs/proc/cmdline.c"
+            fi
+          fi
+
+          # Fix 5: fs/proc/task_mmu.c - tambah include
+          if [ -f fs/proc/task_mmu.c ]; then
+            if ! grep -q "linux/susfs" fs/proc/task_mmu.c; then
+              sed -i '/^#include <linux\/fs\.h>/a #include <linux/susfs.h>\n#include <linux/susfs_def.h>' fs/proc/task_mmu.c
+              echo "[OK] Added susfs includes to fs/proc/task_mmu.c"
+            fi
+          fi
+
+          echo ""
+          echo "== Verifikasi include susfs =="
+          for f in fs/proc_namespace.c fs/stat.c fs/proc/cmdline.c fs/proc/task_mmu.c fs/Makefile; do
+            if [ -f "$f" ]; then
+              echo "-- $f --"
+              grep -n "susfs" "$f" | head -5 || echo "  (no susfs reference)"
             fi
           done
 
-      # ============================================================
-      # STEP: Detect KSU hook header
-      # ============================================================
       - name: Detect KSU hook header
         run: |
           cd kernel-src
           set -e
 
-          # Prioritas 1: ksu_hook.h (yang benar untuk manual hook)
           if [ -f include/linux/ksu_hook.h ]; then
             echo "KSU_HEADER=linux/ksu_hook.h" >> "$GITHUB_ENV"
             echo "[OK] Found: include/linux/ksu_hook.h"
             exit 0
           fi
 
-          # Prioritas 2: cari di KernelSU driver tree
-          FOUND="$(find KernelSU KernelSU-Next drivers/kernelsu .resukisu-src \
-                   2>/dev/null -type f -name 'ksu_hook.h' | head -n 1 || true)"
+          FOUND=$(find KernelSU KernelSU-Next drivers/kernelsu .resukisu-src 2>/dev/null -type f -name 'ksu_hook.h' | head -n 1 || true)
           if [ -n "$FOUND" ]; then
             cp -f "$FOUND" include/linux/ksu_hook.h
             echo "KSU_HEADER=linux/ksu_hook.h" >> "$GITHUB_ENV"
-            echo "[OK] Copied: $FOUND -> include/linux/ksu_hook.h"
+            echo "[OK] Copied: $FOUND"
             exit 0
           fi
 
-          # Prioritas 3: cari header alternatif yang berisi ksu_handle_*
-          ALT="$(find KernelSU KernelSU-Next drivers/kernelsu .resukisu-src \
-                 2>/dev/null -type f -name '*.h' \
-                 -exec grep -l 'ksu_handle_execveat' {} \; \
-                 | head -n 1 || true)"
+          ALT=$(find KernelSU KernelSU-Next drivers/kernelsu .resukisu-src 2>/dev/null -type f -name '*.h' -exec grep -l 'ksu_handle_execveat' {} \; | head -n 1 || true)
           if [ -n "$ALT" ]; then
-            BNAME="$(basename "$ALT")"
+            BNAME=$(basename "$ALT")
             cp -f "$ALT" "include/linux/$BNAME"
             echo "KSU_HEADER=linux/$BNAME" >> "$GITHUB_ENV"
-            echo "[OK] Alternative header: $ALT -> include/linux/$BNAME"
+            echo "[OK] Alternative: $ALT"
             exit 0
           fi
 
-          echo "[FATAL] Tidak ada header ksu_hook.h atau header dengan ksu_handle_*"
-          find KernelSU KernelSU-Next drivers/kernelsu .resukisu-src \
-            2>/dev/null -name "*.h" | head -20
+          echo "[FATAL] Header ksu_hook.h tidak ditemukan"
           exit 1
 
-      # ============================================================
-      # STEP: Apply ReSukiSU manual hooks (6 hooks, SETELAH SUSFS)
-      # ============================================================
-      # 6 hooks wajib non-GKI kernel 4.9:
-      #   1. fs/exec.c              → ksu_handle_execveat
-      #   2. fs/open.c              → ksu_handle_faccessat
-      #   3. fs/read_write.c        → ksu_handle_vfs_read
-      #   4. fs/stat.c              → ksu_handle_stat
-      #   5. drivers/input/input.c  → ksu_handle_input_handle_event
-      #   6. kernel/sys.c           → ksu_handle_setresuid
-      #
-      # Catatan:
-      # - Pakai ksu_hook.h, BUKAN ksu.h
-      # - Tambah #include <linux/version.h> supaya KERNEL_VERSION terdefinisi
-      # - fs/stat.c kernel 4.9 BaikalOS: parameter namanya "flag" (singular)
-      # - kernel/sys.c wajib untuk ReSukiSU v4.1+ (setresuid hook)
-      # ============================================================
-      - name: Apply ReSukiSU manual hooks (6 hooks)
+      # ==========================================================
+      # Manual hooks pakai sed (bukan Python heredoc)
+      # 6 hooks wajib untuk non-GKI 4.9 + ReSukiSU v4.1+
+      # ==========================================================
+      - name: Apply ReSukiSU manual hooks
         run: |
           cd kernel-src
-          export KSU_HEADER="${{ env.KSU_HEADER }}"
+          KSU_HEADER="${{ env.KSU_HEADER }}"
+          echo "Using header: $KSU_HEADER"
 
-          echo "== KSU header yang dipakai: $KSU_HEADER =="
-          grep "ksu_handle_" "include/$KSU_HEADER" 2>/dev/null || true
-          echo ""
+          # Helper function untuk tambah include
+          add_include() {
+            local file="$1"
+            if [ -f "$file" ]; then
+              if ! grep -q "linux/version.h" "$file"; then
+                sed -i '0,/^#include/{s|^#include|#include <linux/version.h>\n&|}' "$file"
+              fi
+              if ! grep -q "$KSU_HEADER" "$file"; then
+                sed -i "0,/^#include/{s|^#include|#include <$KSU_HEADER>\n&|}" "$file"
+              fi
+            fi
+          }
 
-          python3 << 'HOOKPY'
-          import os, re
-          from pathlib import Path
+          # Hook 1: fs/exec.c
+          add_include fs/exec.c
+          if [ -f fs/exec.c ] && ! grep -q "ksu_handle_execveat" fs/exec.c; then
+            # Cari do_execveat_common dan inject setelah opening brace
+            sed -i '/^static int do_execveat_common/,/^{/{ /^{/a\
+	/* ReSukiSU hook */\
+	ksu_handle_execveat(\&fd, \&filename, \&argv, \&envp, \&flags);
+            }' fs/exec.c
+            echo "[OK] Hooked fs/exec.c"
+          fi
 
-          header = os.environ.get("KSU_HEADER", "linux/ksu_hook.h")
-          print(f"Using header: {header}\n")
+          # Hook 2: fs/open.c
+          add_include fs/open.c
+          if [ -f fs/open.c ] && ! grep -q "ksu_handle_faccessat" fs/open.c; then
+            sed -i '/^long do_faccessat/,/^{/{ /^{/a\
+	/* ReSukiSU hook */\
+	ksu_handle_faccessat(\&dfd, \&filename, \&mode, NULL);
+            }' fs/open.c
+            echo "[OK] Hooked fs/open.c"
+          fi
 
-          def add_includes(text, hdr):
-              """Tambah #include <linux/version.h> dan header hook.
-              version.h wajib supaya KERNEL_VERSION() macro terdefinisi
-              dan tidak bikin error 'KERNEL_VERSION not defined'."""
-              needed = [
-                  "#include <linux/version.h>",
-                  f"#include <{hdr}>",
-              ]
-              for inc in needed:
-                  if inc in text:
-                      continue
-                  matches = list(re.finditer(
-                      r'^[ \t]*#include\s+[<"][^>"]+[>"]', text, re.M))
-                  if matches:
-                      pos = matches[-1].end()
-                      text = text[:pos] + "\n" + inc + text[pos:]
-                  else:
-                      text = inc + "\n" + text
-              return text
+          # Hook 3: fs/read_write.c
+          add_include fs/read_write.c
+          if [ -f fs/read_write.c ] && ! grep -q "ksu_handle_vfs_read" fs/read_write.c; then
+            sed -i '/^ssize_t vfs_read/,/^{/{ /^{/a\
+	/* ReSukiSU hook */\
+	ksu_handle_vfs_read(\&file, \&buf, \&count, \&pos);
+            }' fs/read_write.c
+            echo "[OK] Hooked fs/read_write.c"
+          fi
 
-          def inject_hook(text, patterns, hook_code, marker):
-              """Inject hook_code setelah opening brace dari function
-              yang match salah satu pattern. Idempotent via marker."""
-              if marker in text:
-                  return text, True, "already hooked"
+          # Hook 4: fs/stat.c (PENTING: pakai &flag bukan &flags)
+          add_include fs/stat.c
+          if [ -f fs/stat.c ] && ! grep -q "ksu_handle_stat" fs/stat.c; then
+            sed -i '/^int vfs_fstatat/,/^{/{ /^{/a\
+	/* ReSukiSU hook */\
+	ksu_handle_stat(\&dfd, \&filename, \&flag);
+            }' fs/stat.c
+            echo "[OK] Hooked fs/stat.c"
+          fi
 
-              for pat in patterns:
-                  m = re.search(pat, text, re.S | re.M)
-                  if not m:
-                      continue
-                  brace = text.find("{", m.start())
-                  if brace == -1:
-                      continue
-                  pos = brace + 1
-                  while pos < len(text) and text[pos] in (" ", "\t"):
-                      pos += 1
-                  if pos < len(text) and text[pos] == "\n":
-                      pos += 1
-                  block = f"\t/* ReSukiSU hook */\n\t{hook_code}\n"
-                  text = text[:pos] + block + text[pos:]
-                  return text, True, f"injected via: {pat[:60]}"
+          # Hook 5: drivers/input/input.c
+          add_include drivers/input/input.c
+          if [ -f drivers/input/input.c ] && ! grep -q "ksu_handle_input_handle_event" drivers/input/input.c; then
+            sed -i '/^void input_handle_event/,/^{/{ /^{/a\
+	/* ReSukiSU hook */\
+	ksu_handle_input_handle_event(\&type, \&code, \&value);
+            }' drivers/input/input.c
+            # Fallback kalau function-nya static
+            if ! grep -q "ksu_handle_input_handle_event" drivers/input/input.c; then
+              sed -i '/^static void input_handle_event/,/^{/{ /^{/a\
+	/* ReSukiSU hook */\
+	ksu_handle_input_handle_event(\&type, \&code, \&value);
+              }' drivers/input/input.c
+            fi
+            echo "[OK] Hooked drivers/input/input.c"
+          fi
 
-              return text, False, "pattern not found"
-
-          hooks = [
-              # 1. fs/exec.c
-              (
-                  "fs/exec.c",
-                  [
-                      r"static\s+int\s+do_execveat_common\s*\(",
-                      r"static\s+int\s+__do_execve_file\s*\(",
-                      r"int\s+do_execve\s*\(",
-                  ],
-                  "ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);",
-                  "ksu_handle_execveat(",
-              ),
-              # 2. fs/open.c
-              (
-                  "fs/open.c",
-                  [
-                      r"long\s+do_faccessat\s*\(",
-                      r"SYSCALL_DEFINE\d\s*\(\s*faccessat",
-                  ],
-                  "ksu_handle_faccessat(&dfd, &filename, &mode, NULL);",
-                  "ksu_handle_faccessat(",
-              ),
-              # 3. fs/read_write.c
-              (
-                  "fs/read_write.c",
-                  [r"ssize_t\s+vfs_read\s*\("],
-                  "ksu_handle_vfs_read(&file, &buf, &count, &pos);",
-                  "ksu_handle_vfs_read(",
-              ),
-              # 4. fs/stat.c
-              # PENTING: kernel 4.9 BaikalOS pakai "flag" (singular), bukan "flags"
-              (
-                  "fs/stat.c",
-                  [
-                      r"int\s+vfs_fstatat\s*\(",
-                      r"int\s+vfs_statx\s*\(",
-                      r"SYSCALL_DEFINE\d\s*\(\s*newfstatat",
-                  ],
-                  "ksu_handle_stat(&dfd, &filename, &flag);",
-                  "ksu_handle_stat(",
-              ),
-              # 5. drivers/input/input.c
-              (
-                  "drivers/input/input.c",
-                  [
-                      r"static\s+void\s+input_handle_event\s*\(",
-                      r"void\s+input_handle_event\s*\(",
-                  ],
-                  "ksu_handle_input_handle_event(&type, &code, &value);",
-                  "ksu_handle_input_handle_event(",
-              ),
-              # 6. kernel/sys.c — WAJIB untuk ReSukiSU v4.1+
-              # Error sebelumnya: "You lost ksu_handle_setresuid hook"
-              (
-                  "kernel/sys.c",
-                  [
-                      r"SYSCALL_DEFINE3\s*\(\s*setresuid\s*,",
-                      r"__sys_setresuid\s*\(",
-                  ],
-                  "ksu_handle_setresuid(&ruid, &euid, &suid);",
-                  "ksu_handle_setresuid(",
-              ),
-          ]
-
-          results = []
-          for filepath, patterns, hook_code, marker in hooks:
-              p = Path(filepath)
-              if not p.exists():
-                  results.append((filepath, "SKIP", "file not found"))
-                  continue
-
-              text = p.read_text(encoding="utf-8", errors="replace")
-              text = add_includes(text, header)
-              text, ok, detail = inject_hook(text, patterns, hook_code, marker)
-              p.write_text(text, encoding="utf-8")
-
-              results.append((filepath, "OK" if ok else "WARN", detail))
-
-          print("=" * 65)
-          print("HOOK SUMMARY (6 hooks)")
-          print("=" * 65)
-          for fp, status, detail in results:
-              icon = {"OK": "✓", "WARN": "⚠", "SKIP": "⊘"}.get(status, "?")
-              print(f"  {icon} [{status:4s}] {fp}")
-              print(f"          → {detail}")
-          print()
-
-          warn_count = sum(1 for _, s, _ in results if s != "OK")
-          if warn_count:
-              print(f"PERINGATAN: {warn_count} hook bermasalah.")
-              print("Build mungkin jalan tapi ReSukiSU tidak berfungsi penuh.")
-          else:
-              print("Semua 6 hook berhasil.")
-          HOOKPY
+          # Hook 6: kernel/sys.c (setresuid) - WAJIB ReSukiSU v4.1+
+          add_include kernel/sys.c
+          if [ -f kernel/sys.c ] && ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
+            # Cari SYSCALL_DEFINE3(setresuid,...) dan inject setelah brace
+            sed -i '/^SYSCALL_DEFINE3(setresuid/,/^{/{ /^{/a\
+	/* ReSukiSU hook */\
+	ksu_handle_setresuid(\&ruid, \&euid, \&suid);
+            }' kernel/sys.c
+            echo "[OK] Hooked kernel/sys.c"
+          fi
 
           echo ""
           echo "== Verifikasi hooks =="
-          for f in fs/exec.c fs/open.c fs/read_write.c fs/stat.c \
-                   drivers/input/input.c kernel/sys.c; do
+          for f in fs/exec.c fs/open.c fs/read_write.c fs/stat.c drivers/input/input.c kernel/sys.c; do
             if [ -f "$f" ]; then
-              HOOKS=$(grep -o "ksu_handle_[a-z_]*" "$f" 2>/dev/null \
-                      | sort -u | tr '\n' ' ' || echo "none")
-              echo "  $f -> $HOOKS"
-            else
-              echo "  $f -> FILE NOT FOUND"
+              HOOKS=$(grep -o "ksu_handle_[a-z_]*" "$f" 2>/dev/null | sort -u | tr '\n' ' ')
+              echo "  $f -> ${HOOKS:-NONE}"
             fi
           done
 
-      # ============================================================
-      # STEP: Prepare defconfig
-      # ============================================================
-      - name: Prepare defconfig (extracted config + ReSukiSU + SUSFS flags)
+      - name: Prepare defconfig
         run: |
           cd kernel-src
-
           DEFCONFIG_PATH="arch/arm64/configs/${{ github.event.inputs.defconfig }}"
 
           if [ ! -f "$DEFCONFIG_PATH" ]; then
-            echo "ERROR: defconfig tidak ditemukan di $DEFCONFIG_PATH"
-            find arch/arm64/configs -iname "*845*" \
-              -o -iname "*beryllium*" -o -iname "*xiaomi*" 2>/dev/null
+            echo "ERROR: $DEFCONFIG_PATH tidak ditemukan"
+            find arch/arm64/configs -iname "*845*" -o -iname "*beryllium*" -o -iname "*xiaomi*" 2>/dev/null
             exit 1
           fi
 
           if [ "${{ github.event.inputs.use_extracted_config }}" = "true" ]; then
             EXTRACTED_CFG="$GITHUB_WORKSPACE/extracted-config/my_defconfig.txt"
             if [ -f "$EXTRACTED_CFG" ]; then
-              echo "[INFO] Memakai config hasil extract boot.img (menimpa $DEFCONFIG_PATH)."
+              echo "[INFO] Pakai extracted config"
               cp "$EXTRACTED_CFG" "$DEFCONFIG_PATH"
-            else
-              echo "[WARN] extracted config tidak ditemukan, pakai defconfig asli."
             fi
           fi
 
-          # Bersihkan entry KSU/SUSFS lama
           sed -i '/^CONFIG_KSU/d;/^# CONFIG_KSU is not set/d' "$DEFCONFIG_PATH"
           sed -i '/SUSFS/d' "$DEFCONFIG_PATH"
           sed -i '/^CONFIG_KSU_KPROBE_HOOKS/d' "$DEFCONFIG_PATH"
 
-          # Tambahkan config ReSukiSU + SUSFS
-          # Catatan: TIDAK pakai CONFIG_KSU_KPROBE_HOOKS=y
-          # karena kita pakai manual hooks (bukan kprobe)
-          {
-            echo ""
-            echo "# === ReSukiSU ==="
-            echo "CONFIG_KSU=y"
-            echo "CONFIG_KPROBES=y"
-            echo "CONFIG_KPROBE_EVENTS=y"
-            echo ""
-            echo "# === SUSFS ==="
-            echo "CONFIG_KSU_SUSFS=y"
-            echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
-            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
-            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
-            echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y"
-            echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
-            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
-            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
-            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
-            echo "CONFIG_KSU_SUSFS_SUS_SU=y"
-            echo ""
-            echo "# === Filesystem (dibutuhkan KSU & SUSFS) ==="
-            echo "CONFIG_OVERLAY_FS=y"
-            echo "CONFIG_TMPFS_XATTR=y"
-            echo "CONFIG_TMPFS_POSIX_ACL=y"
-          } >> "$DEFCONFIG_PATH"
+          cat >> "$DEFCONFIG_PATH" << 'EOFCFG'
 
-          echo "[OK] Defconfig berhasil dipatch."
-          echo ""
+          # === ReSukiSU ===
+          CONFIG_KSU=y
+          CONFIG_KPROBES=y
+          CONFIG_KPROBE_EVENTS=y
+
+          # === SUSFS ===
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_SU=y
+
+          # === Filesystem ===
+          CONFIG_OVERLAY_FS=y
+          CONFIG_TMPFS_XATTR=y
+          CONFIG_TMPFS_POSIX_ACL=y
+          EOFCFG
+
+          # Bersihkan indentasi dari heredoc
+          sed -i 's/^          //' "$DEFCONFIG_PATH"
+
           echo "== KSU/SUSFS entries =="
           grep -E "CONFIG_KSU|CONFIG_KPROBES|SUSFS|OVERLAY" "$DEFCONFIG_PATH" | sort
 
-      # ============================================================
-      # STEP: Patch vdso32 (sama persis workflow KSU-Next)
-      # ============================================================
-      - name: Patch arch/arm64/Makefile (fix clang vdso32 assembler error)
+      - name: Patch arch/arm64/Makefile (fix clang vdso32)
         run: |
           cd kernel-src
           MAIN_MK="arch/arm64/Makefile"
-          [ -f "$MAIN_MK" ] || { echo "ERROR: $MAIN_MK tidak ditemukan!"; exit 1; }
+          [ -f "$MAIN_MK" ] || exit 1
 
-          grep -n "CLANG_PREFIX32\|GCC_TOOLCHAIN32\|CLANG_TARGET_ARM32" \
-            "$MAIN_MK" || echo "TIDAK DITEMUKAN."
+          sed -i -E 's@(CLANG_PREFIX32[[:space:]]*:=[[:space:]]*--prefix=\$\(GCC_TOOLCHAIN32_DIR\))[[:space:]]*$@\1$(notdir $(CROSS_COMPILE_ARM32))@' "$MAIN_MK"
+          grep -n "CLANG_PREFIX32" "$MAIN_MK" || true
 
-          cp "$MAIN_MK" "$MAIN_MK.orig"
-          sed -i -E \
-            's@(CLANG_PREFIX32[[:space:]]*:=[[:space:]]*--prefix=\$\(GCC_TOOLCHAIN32_DIR\))[[:space:]]*$@\1$(notdir $(CROSS_COMPILE_ARM32))@' \
-            "$MAIN_MK"
-
-          if ! diff -q "$MAIN_MK" "$MAIN_MK.orig" > /dev/null; then
-            echo "[OK] Patch CLANG_PREFIX32 berhasil."
-            grep -n "CLANG_PREFIX32" "$MAIN_MK"
-          else
-            echo "[WARN] Pattern tidak match, tidak berubah."
-            grep -n -B5 -A10 "CLANG_TARGET_ARM32\|CLANG_PREFIX32" "$MAIN_MK" || true
-          fi
-          rm -f "$MAIN_MK.orig"
-
-      # ============================================================
-      # STEP: Skip broken DTB (sama persis workflow KSU-Next)
-      # ============================================================
-      - name: Skip DTB yang tidak relevan/rusak
+      - name: Skip broken DTB
         run: |
           cd kernel-src
           DTS_MK="arch/arm64/boot/dts/qcom/Makefile"
-          [ -f "$DTS_MK" ] || { echo "WARN: $DTS_MK tidak ditemukan."; exit 0; }
+          [ -f "$DTS_MK" ] || exit 0
 
-          BROKEN_DTBS=(
-            "sdm845-v2-qvr-evt.dtb"
-            "sdm845-v2-qvr-dvt.dtb"
-            "sdm845-interposer-sdm670-mtp.dtb"
-            "sdm845-interposer-sdm670-cdp.dtb"
-          )
-
-          cp "$DTS_MK" "$DTS_MK.orig"
-          for dtb in "${BROKEN_DTBS[@]}"; do
-            if grep -q "$dtb" "$DTS_MK"; then
-              sed -i "/$dtb/d" "$DTS_MK"
-              echo "[OK] Dihapus: $dtb"
-            else
-              echo "[INFO] Tidak ditemukan: $dtb"
-            fi
+          for dtb in sdm845-v2-qvr-evt.dtb sdm845-v2-qvr-dvt.dtb sdm845-interposer-sdm670-mtp.dtb sdm845-interposer-sdm670-cdp.dtb; do
+            sed -i "/$dtb/d" "$DTS_MK"
           done
 
-          diff "$DTS_MK.orig" "$DTS_MK" || true
-          rm -f "$DTS_MK.orig"
-
-      # ============================================================
-      # STEP: Compile kernel
-      # ============================================================
       - name: Compile Kernel
         env:
           KBUILD_BUILD_USER: "tester"
@@ -907,21 +510,13 @@ jobs:
           make "${MAKE_ARGS[@]}" ${{ github.event.inputs.defconfig }}
           make "${MAKE_ARGS[@]}" olddefconfig
 
-          echo ""
           echo "== Config check =="
-          for cfg in \
-            CONFIG_KSU CONFIG_KPROBES CONFIG_KPROBE_EVENTS \
-            CONFIG_KSU_SUSFS CONFIG_KSU_SUSFS_SUS_PATH \
-            CONFIG_KSU_SUSFS_SUS_MOUNT CONFIG_KSU_SUSFS_SUS_KSTAT \
-            CONFIG_KSU_SUSFS_SUS_OVERLAYFS CONFIG_KSU_SUSFS_TRY_UMOUNT \
-            CONFIG_KSU_SUSFS_SPOOF_UNAME CONFIG_KSU_SUSFS_ENABLE_LOG \
-            CONFIG_KSU_SUSFS_OPEN_REDIRECT CONFIG_KSU_SUSFS_SUS_SU \
-            CONFIG_OVERLAY_FS; do
-            echo "  $(grep "^${cfg}=" $OUT_DIR/.config 2>/dev/null || echo "${cfg}=NOT SET")"
+          for cfg in CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_OVERLAY_FS; do
+            grep "^${cfg}=" $OUT_DIR/.config || echo "${cfg}=NOT SET"
           done
 
           if ! grep -q '^CONFIG_KSU=y' $OUT_DIR/.config; then
-            echo "FATAL: CONFIG_KSU=y tidak aktif di .config!"
+            echo "FATAL: CONFIG_KSU=y tidak aktif"
             exit 1
           fi
 
@@ -930,80 +525,50 @@ jobs:
           BUILD_EXIT=${PIPESTATUS[0]}
           set -e
 
-          echo ""
-          echo "== Build exit code: $BUILD_EXIT =="
+          echo "== Exit: $BUILD_EXIT =="
+          BUILD_OK=0
 
-          IMAGE_OK=0
-          IMAGE_GZ_DTB_OK=0
-
-          [ -f "$OUT_DIR/arch/arm64/boot/Image" ] && {
-            ls -la "$OUT_DIR/arch/arm64/boot/Image"; IMAGE_OK=1; } \
-            || echo "Image TIDAK ADA"
-
-          [ -f "$OUT_DIR/arch/arm64/boot/Image.gz-dtb" ] && {
+          if [ -f "$OUT_DIR/arch/arm64/boot/Image.gz-dtb" ]; then
             ls -la "$OUT_DIR/arch/arm64/boot/Image.gz-dtb"
-            IMAGE_GZ_DTB_OK=1; } \
-            || echo "Image.gz-dtb TIDAK ADA"
-
-          if [ "$IMAGE_GZ_DTB_OK" -eq 1 ]; then
-            echo "[OK] Image.gz-dtb berhasil."
             BUILD_OK=1
-          elif [ "$IMAGE_OK" -eq 1 ]; then
-            echo "[SEBAGIAN OK] Image berhasil, Image.gz-dtb belum."
+          elif [ -f "$OUT_DIR/arch/arm64/boot/Image" ]; then
+            ls -la "$OUT_DIR/arch/arm64/boot/Image"
             BUILD_OK=1
           else
-            echo "[GAGAL] Tidak ada Image maupun Image.gz-dtb."
-            BUILD_OK=0
+            echo "[GAGAL] Tidak ada Image maupun Image.gz-dtb"
           fi
 
           echo "BUILD_OK=$BUILD_OK" >> "$GITHUB_ENV"
           [ "$BUILD_OK" -eq 1 ] || exit 1
 
-      # ============================================================
-      # STEP: Metadata + Artifacts
-      # ============================================================
       - name: Capture Build Metadata
         if: env.BUILD_OK == '1'
         run: |
           cd kernel-src
           KERNEL_COMMIT=$(git rev-parse --short HEAD)
-          KERNEL_COMMIT_FULL=$(git rev-parse HEAD)
-
           KSU_DIR="${{ env.KSU_ROOT_DIR }}"
           KSU_COMMIT="unknown"
-          [ -n "$KSU_DIR" ] && [ -d "$KSU_DIR" ] && \
-            KSU_COMMIT=$(cd "$KSU_DIR" && git rev-parse --short HEAD 2>/dev/null || echo "embedded")
-
+          [ -n "$KSU_DIR" ] && [ -d "$KSU_DIR" ] && KSU_COMMIT=$(cd "$KSU_DIR" && git rev-parse --short HEAD 2>/dev/null || echo "embedded")
           SUSFS_COMMIT="unknown"
-          [ -d ".susfs4ksu" ] && \
-            SUSFS_COMMIT=$(cd .susfs4ksu && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-
+          [ -d ".susfs4ksu" ] && SUSFS_COMMIT=$(cd .susfs4ksu && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
           KERNEL_VERSION_STRING=$(cat out/include/config/kernel.release 2>/dev/null || echo unknown)
           BUILD_DATE=$(date -u '+%Y-%m-%d %H:%M UTC')
 
           cat > ../build-metadata.json << JSONEOF
           {
             "build_date": "${BUILD_DATE}",
-            "kernel_source": "${{ github.event.inputs.kernel_source }}",
             "kernel_branch": "${{ github.event.inputs.kernel_branch }}",
             "kernel_commit": "${KERNEL_COMMIT}",
-            "kernel_commit_full": "${KERNEL_COMMIT_FULL}",
             "root_solution": "ReSukiSU + SUSFS",
-            "resukisu_repo": "${{ github.event.inputs.resukisu_repo }}",
             "resukisu_branch": "${{ github.event.inputs.resukisu_branch }}",
             "resukisu_commit": "${KSU_COMMIT}",
-            "susfs_repo": "${{ github.event.inputs.susfs_repo }}",
             "susfs_branch": "${{ github.event.inputs.susfs_branch }}",
             "susfs_commit": "${SUSFS_COMMIT}",
-            "susfs_patch_url": "${{ github.event.inputs.susfs_patch_url }}",
-            "kernel_version_string": "${KERNEL_VERSION_STRING}",
+            "kernel_version": "${KERNEL_VERSION_STRING}",
             "defconfig": "${{ github.event.inputs.defconfig }}",
-            "use_extracted_config": "${{ github.event.inputs.use_extracted_config }}",
-            "clang_url": "${{ github.event.inputs.clang_url }}",
             "zip_name": "${{ github.event.inputs.zip_name }}"
           }
           JSONEOF
-
           cat ../build-metadata.json
 
       - name: Upload Build Metadata
@@ -1014,7 +579,7 @@ jobs:
           path: build-metadata.json
           if-no-files-found: warn
 
-      - name: Upload Build Log (selalu, untuk debug)
+      - name: Upload Build Log
         if: always()
         uses: actions/upload-artifact@v4
         with:
