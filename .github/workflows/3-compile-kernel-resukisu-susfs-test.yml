@@ -166,25 +166,12 @@ jobs:
           #endif' fs/proc_namespace.c
               echo "[OK] Added #include <linux/susfs_def.h>"
             fi
-
-            if ! grep -q "susfs_is_current_ksu_domain" fs/proc_namespace.c; then
-              sed -i '/#include "internal.h"/a\
-          \
-          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\
-          extern bool susfs_is_current_ksu_domain(void);\
-          extern bool susfs_hide_sus_mnts_for_non_su_procs;\
-          #endif' fs/proc_namespace.c
-              echo "[OK] Added extern declarations"
-            fi
           fi
 
           echo ""
           echo "==========================================="
           echo "Fix 2: fs/stat.c - signature kernel 4.9 BaikalOS"
           echo "==========================================="
-          # Signature real:
-          #   return inode->i_op->getattr(path->mnt, path->dentry, stat);
-          # Kita wrap dengan #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
           if [ -f fs/stat.c ] && ! grep -q "int err = inode->i_op->getattr" fs/stat.c; then
             python3 << 'PYEOF'
           import re
@@ -193,9 +180,6 @@ jobs:
           p = Path("fs/stat.c")
           text = p.read_text()
 
-          # Pattern signature kernel 4.9 BaikalOS
-          # if (inode->i_op->getattr)
-          #     return inode->i_op->getattr(path->mnt, path->dentry, stat);
           pattern = re.compile(
               r'(\tif\s*\(inode->i_op->getattr\)\s*\n)'
               r'(\t\treturn inode->i_op->getattr\(path->mnt,\s*path->dentry,\s*stat\);)',
@@ -221,15 +205,9 @@ jobs:
               p.write_text(new_text)
               print(f"[OK] Wrapped inode->i_op->getattr ({n} match)")
           else:
-              print("[FAIL] Pattern not matched, showing current state:")
-              for i, line in enumerate(text.split('\n')[55:75], start=56):
-                  print(f"  {i}: {line}")
+              print("[FAIL] Pattern not matched")
           PYEOF
           fi
-
-          echo ""
-          echo "== Verifikasi fs/stat.c =="
-          grep -n "susfs\|inode->i_op->getattr" fs/stat.c | head -15
 
           echo ""
           echo "==========================================="
@@ -239,14 +217,61 @@ jobs:
 
           echo ""
           echo "==========================================="
-          echo "Fix 4: Pastikan susfs.h ter-include di file yg butuh"
+          echo "Fix 4: FORCE include susfs.h ke file yg butuh"
           echo "==========================================="
+          python3 << 'PYEOF'
+          from pathlib import Path
+
+          files_need_susfs = [
+              "fs/open.c",
+              "fs/stat.c",
+              "fs/proc_namespace.c",
+              "fs/proc/task_mmu.c",
+              "fs/proc/cmdline.c",
+          ]
+
+          for filepath in files_need_susfs:
+              p = Path(filepath)
+              if not p.exists():
+                  print(f"[SKIP] {filepath} not found")
+                  continue
+
+              lines = p.read_text().split('\n')
+
+              has_susfs = any('linux/susfs.h' in l for l in lines)
+              has_susfs_def = any('linux/susfs_def.h' in l for l in lines)
+
+              if has_susfs and has_susfs_def:
+                  print(f"[SKIP] {filepath} already has both susfs includes")
+                  continue
+
+              insert_idx = -1
+              for i, line in enumerate(lines):
+                  if line.strip().startswith('#include'):
+                      insert_idx = i
+                      break
+
+              if insert_idx == -1:
+                  print(f"[FAIL] {filepath}: no #include found")
+                  continue
+
+              new_includes = []
+              if not has_susfs:
+                  new_includes.append('#include <linux/susfs.h>')
+              if not has_susfs_def:
+                  new_includes.append('#include <linux/susfs_def.h>')
+
+              lines[insert_idx:insert_idx] = new_includes
+              p.write_text('\n'.join(lines))
+              print(f"[OK] {filepath}: added {new_includes}")
+          PYEOF
+
+          echo ""
+          echo "== Verifikasi include susfs =="
           for f in fs/open.c fs/stat.c fs/proc_namespace.c fs/proc/task_mmu.c; do
             if [ -f "$f" ]; then
-              if ! grep -q "linux/susfs.h" "$f"; then
-                sed -i '0,/^#include/s||#include <linux/susfs.h>\n#include <linux/susfs_def.h>\n&|' "$f"
-                echo "[OK] Added susfs includes to $f"
-              fi
+              INC=$(grep -n "linux/susfs" "$f" | head -3 | tr '\n' ' ')
+              echo "  $f -> ${INC:-NONE}"
             fi
           done
 
@@ -254,8 +279,6 @@ jobs:
           echo "==========================================="
           echo "Fix 5: Force extern declarations di fs/proc_namespace.c"
           echo "==========================================="
-          # sed -i multi-line dengan backslash tidak reliable
-          # Pakai python untuk pastikan extern declaration ter-inject
           if [ -f fs/proc_namespace.c ] && ! grep -q "extern bool susfs_is_current_ksu_domain" fs/proc_namespace.c; then
             python3 << 'PYEOF'
           from pathlib import Path
@@ -290,12 +313,12 @@ jobs:
       # Implementasi hook ada di drivers/kernelsu (ReSukiSU)
       # Kita cuma butuh deklarasi supaya call site di fs/*.c bisa compile
       # ==========================================================
-      - name: Generate ksu_hook.h (7 hook declarations)
+      - name: Generate ksu_hook.h (8 hook declarations)
         run: |
           cd kernel-src
 
           cat > include/linux/ksu_hook.h << 'HEADEREOF'
-          /* Auto-generated for ReSukiSU manual hooks */
+          /* Auto-generated for ReSukiSU manual hooks (8 hooks) */
           #ifndef __KSU_HOOK_H
           #define __KSU_HOOK_H
 
@@ -319,11 +342,13 @@ jobs:
           extern int ksu_handle_input_handle_event(unsigned int *type,
                                                     unsigned int *code, int *value);
           extern int ksu_handle_setresuid(uid_t *ruid, uid_t *euid, uid_t *suid);
+          extern int ksu_handle_sys_reboot(int *magic1, int *magic2,
+                                           unsigned int *cmd, void __user **arg);
 
           #endif
           HEADEREOF
 
-          echo "[OK] Generated ksu_hook.h dengan 7 declarations"
+          echo "[OK] Generated ksu_hook.h dengan 8 declarations"
 
       # ==========================================================
       # Fix fs/exec.c: hapus struct user_arg_ptr duplikat
@@ -358,7 +383,7 @@ jobs:
       # ==========================================================
       # Inject 5 manual hooks (execveat sudah oleh setup.sh)
       # ==========================================================
-      - name: Apply 7 manual hooks
+      - name: Apply 8 manual hooks
         run: |
           cd kernel-src
 
@@ -401,7 +426,7 @@ jobs:
             echo "[OK] fs/exec.c execveat"
           fi
 
-          # 1. fs/open.c → faccessat (parameter 'filename' is const char __user *)
+          # 1. fs/open.c → faccessat
           add_include fs/open.c
           if ! grep -q "ksu_handle_faccessat" fs/open.c; then
             inject_hook fs/open.c \
@@ -418,8 +443,7 @@ jobs:
             echo "[OK] fs/read_write.c vfs_read"
           fi
 
-          # 3. fs/read_write.c → sys_read (BARU, WAJIB untuk ReSukiSU v4.1+)
-          # Cari SYSCALL_DEFINE3(read, ...) di file yang sama
+          # 3. fs/read_write.c → sys_read
           if ! grep -q "ksu_handle_sys_read" fs/read_write.c; then
             inject_hook fs/read_write.c "SYSCALL_DEFINE3.read" \
               "ksu_handle_sys_read(&fd, &buf, &count);"
@@ -458,9 +482,17 @@ jobs:
             echo "[OK] kernel/sys.c"
           fi
 
+          # 7. kernel/reboot.c → sys_reboot (BARU, hook ke-8)
+          add_include kernel/reboot.c
+          if [ -f kernel/reboot.c ] && ! grep -q "ksu_handle_sys_reboot" kernel/reboot.c; then
+            inject_hook kernel/reboot.c "SYSCALL_DEFINE4.reboot" \
+              "ksu_handle_sys_reboot(&magic1, &magic2, &cmd, &arg);"
+            echo "[OK] kernel/reboot.c sys_reboot"
+          fi
+
           echo ""
           echo "== Verifikasi hooks =="
-          for f in fs/exec.c fs/open.c fs/read_write.c fs/stat.c drivers/input/input.c kernel/sys.c; do
+          for f in fs/exec.c fs/open.c fs/read_write.c fs/stat.c drivers/input/input.c kernel/sys.c kernel/reboot.c; do
             [ -f "$f" ] || continue
             HOOKS=$(grep -o "ksu_handle_[a-z_]*" "$f" 2>/dev/null | sort -u | tr '\n' ' ')
             echo "  $f -> ${HOOKS:-NONE}"
