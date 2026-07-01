@@ -169,6 +169,24 @@ jobs:
           find include/linux -name "ksu*" -o -name "ksud*" 2>/dev/null | sort
           find KernelSU KernelSU-Next 2>/dev/null -name "*.h" | head -10
 
+      - name: Debug - cek SUSFS bawaan ReSukiSU
+        run: |
+          cd kernel-src
+          echo "== Cari Kconfig SUSFS di ReSukiSU =="
+          find KernelSU -name "Kconfig*" -exec grep -l "SUSFS" {} \;
+          echo ""
+          echo "== Isi Kconfig KernelSU =="
+          cat KernelSU/kernel/Kconfig 2>/dev/null | grep -A 2 -B 1 "SUSFS" || echo "(tidak ada SUSFS di Kconfig)"
+          echo ""
+          echo "== Cari file SUSFS di ReSukiSU tree =="
+          find KernelSU -iname "*susfs*" 2>/dev/null
+          echo ""
+          echo "== Cari file source di KernelSU/kernel =="
+          ls KernelSU/kernel/*.c KernelSU/kernel/*.h 2>/dev/null | head -30
+          echo ""
+          echo "== Cari deklarasi ksu_handle_* di KernelSU =="
+          grep -rn "ksu_handle_" KernelSU/kernel/*.h 2>/dev/null | head -20
+
       - name: Integrate SUSFS
         run: |
           cd kernel-src
