@@ -237,13 +237,60 @@ jobs:
           echo "==========================================="
           echo "[SKIP] Whitespace difference only"
 
+          echo ""
+          echo "==========================================="
+          echo "Fix 4: Pastikan susfs.h ter-include di file yg butuh"
+          echo "==========================================="
+          for f in fs/open.c fs/stat.c fs/proc_namespace.c fs/proc/task_mmu.c; do
+            if [ -f "$f" ]; then
+              if ! grep -q "linux/susfs.h" "$f"; then
+                sed -i '0,/^#include/s||#include <linux/susfs.h>\n#include <linux/susfs_def.h>\n&|' "$f"
+                echo "[OK] Added susfs includes to $f"
+              fi
+            fi
+          done
+
+          echo ""
+          echo "==========================================="
+          echo "Fix 5: Force extern declarations di fs/proc_namespace.c"
+          echo "==========================================="
+          # sed -i multi-line dengan backslash tidak reliable
+          # Pakai python untuk pastikan extern declaration ter-inject
+          if [ -f fs/proc_namespace.c ] && ! grep -q "extern bool susfs_is_current_ksu_domain" fs/proc_namespace.c; then
+            python3 << 'PYEOF'
+          from pathlib import Path
+          p = Path("fs/proc_namespace.c")
+          lines = p.read_text().split('\n')
+          new_lines = []
+          inserted = False
+          for line in lines:
+              new_lines.append(line)
+              if not inserted and '#include "internal.h"' in line:
+                  new_lines.append('')
+                  new_lines.append('#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT')
+                  new_lines.append('extern bool susfs_is_current_ksu_domain(void);')
+                  new_lines.append('extern bool susfs_hide_sus_mnts_for_non_su_procs;')
+                  new_lines.append('#endif')
+                  new_lines.append('')
+                  inserted = True
+                  print("[OK] Injected extern declarations")
+          p.write_text('\n'.join(new_lines))
+          if not inserted:
+              print("[WARN] internal.h include not found")
+          PYEOF
+          fi
+
+          echo ""
+          echo "== Verifikasi extern di fs/proc_namespace.c =="
+          grep -n "extern\|susfs" fs/proc_namespace.c | head -15
+
       # ==========================================================
       # Buat ksu_hook.h dengan deklarasi 5 hooks (bukan stub)
       # ==========================================================
       # Implementasi hook ada di drivers/kernelsu (ReSukiSU)
       # Kita cuma butuh deklarasi supaya call site di fs/*.c bisa compile
       # ==========================================================
-      - name: Generate ksu_hook.h (6 hook declarations)
+      - name: Generate ksu_hook.h (7 hook declarations)
         run: |
           cd kernel-src
 
@@ -261,12 +308,14 @@ jobs:
 
           extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
                                           void *argv, void *envp, int *flags);
-          extern int ksu_handle_faccessat(int *dfd, struct filename **filename_user,
+          extern int ksu_handle_faccessat(int *dfd, void *filename_user,
                                           int *mode, int *flags);
-          extern int ksu_handle_stat(int *dfd, struct filename **filename_user,
+          extern int ksu_handle_stat(int *dfd, void *filename_user,
                                      int *flags);
           extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr,
                                          size_t *count_ptr, loff_t **pos);
+          extern int ksu_handle_sys_read(unsigned int *fd, char __user **buf_ptr,
+                                          size_t *count_ptr);
           extern int ksu_handle_input_handle_event(unsigned int *type,
                                                     unsigned int *code, int *value);
           extern int ksu_handle_setresuid(uid_t *ruid, uid_t *euid, uid_t *suid);
@@ -274,7 +323,7 @@ jobs:
           #endif
           HEADEREOF
 
-          echo "[OK] Generated ksu_hook.h dengan 6 declarations"
+          echo "[OK] Generated ksu_hook.h dengan 7 declarations"
 
       # ==========================================================
       # Fix fs/exec.c: hapus struct user_arg_ptr duplikat
@@ -309,7 +358,7 @@ jobs:
       # ==========================================================
       # Inject 5 manual hooks (execveat sudah oleh setup.sh)
       # ==========================================================
-      - name: Apply 6 manual hooks (termasuk execveat)
+      - name: Apply 7 manual hooks
         run: |
           cd kernel-src
 
@@ -340,16 +389,11 @@ jobs:
             fi
           }
 
-          # 0. fs/exec.c → execveat (WAJIB, jangan bergantung pada setup.sh)
+          # 0. fs/exec.c → execveat
           add_include fs/exec.c
           if ! grep -q "ksu_handle_execveat" fs/exec.c; then
-            # Coba pattern do_execveat_common dulu (kernel 4.9 typical)
             inject_hook fs/exec.c "static int do_execveat_common" \
               "ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);"
-            if ! grep -q "ksu_handle_execveat" fs/exec.c; then
-              inject_hook fs/exec.c "int do_execveat_common" \
-                "ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);"
-            fi
             if ! grep -q "ksu_handle_execveat" fs/exec.c; then
               inject_hook fs/exec.c "do_execveat_common" \
                 "ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);"
@@ -357,12 +401,12 @@ jobs:
             echo "[OK] fs/exec.c execveat"
           fi
 
-          # 1. fs/open.c → faccessat
+          # 1. fs/open.c → faccessat (parameter 'filename' is const char __user *)
           add_include fs/open.c
           if ! grep -q "ksu_handle_faccessat" fs/open.c; then
             inject_hook fs/open.c \
               "SYSCALL_DEFINE3.faccessat" \
-              "ksu_handle_faccessat(&dfd, (struct filename **)&filename, &mode, NULL);"
+              "ksu_handle_faccessat(&dfd, &filename, &mode, NULL);"
             echo "[OK] fs/open.c faccessat"
           fi
 
@@ -371,22 +415,30 @@ jobs:
           if ! grep -q "ksu_handle_vfs_read" fs/read_write.c; then
             inject_hook fs/read_write.c "ssize_t vfs_read" \
               "ksu_handle_vfs_read(&file, &buf, &count, &pos);"
-            echo "[OK] fs/read_write.c"
+            echo "[OK] fs/read_write.c vfs_read"
           fi
 
-          # 3. fs/stat.c → stat
+          # 3. fs/read_write.c → sys_read (BARU, WAJIB untuk ReSukiSU v4.1+)
+          # Cari SYSCALL_DEFINE3(read, ...) di file yang sama
+          if ! grep -q "ksu_handle_sys_read" fs/read_write.c; then
+            inject_hook fs/read_write.c "SYSCALL_DEFINE3.read" \
+              "ksu_handle_sys_read(&fd, &buf, &count);"
+            echo "[OK] fs/read_write.c sys_read"
+          fi
+
+          # 4. fs/stat.c → stat
           add_include fs/stat.c
           if ! grep -q "ksu_handle_stat" fs/stat.c; then
             inject_hook fs/stat.c "int vfs_fstatat" \
               "ksu_handle_stat(&dfd, &filename, &flag);"
             if ! grep -q "ksu_handle_stat" fs/stat.c; then
               inject_hook fs/stat.c "SYSCALL_DEFINE4.newfstatat" \
-                "ksu_handle_stat(&dfd, (struct filename **)&filename, &flag);"
+                "ksu_handle_stat(&dfd, &filename, &flag);"
             fi
             echo "[OK] fs/stat.c"
           fi
 
-          # 4. drivers/input/input.c → input_handle_event
+          # 5. drivers/input/input.c → input_handle_event
           add_include drivers/input/input.c
           if ! grep -q "ksu_handle_input_handle_event" drivers/input/input.c; then
             inject_hook drivers/input/input.c "void input_handle_event" \
@@ -398,7 +450,7 @@ jobs:
             echo "[OK] drivers/input/input.c"
           fi
 
-          # 5. kernel/sys.c → setresuid
+          # 6. kernel/sys.c → setresuid
           add_include kernel/sys.c
           if ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
             inject_hook kernel/sys.c "SYSCALL_DEFINE3.setresuid" \
