@@ -309,13 +309,12 @@ jobs:
 
           echo ""
           echo "==========================================="
-          echo "Fix 6: Ensure susfs functions declared BEFORE first use"
+          echo "Fix 6: Force forward declaration di fs/stat.c"
           echo "==========================================="
-          # Susfs patch inject call ke fs/stat.c tapi declaration
-          # susfs_sus_kstat_spoof_generic_fillattr mungkin belum ter-inject
-          # atau posisinya setelah call
-          #
-          # Solusi: inject forward declaration di awal fs/stat.c
+          # susfs.h mungkin declare function sebagai void,
+          # tapi call di fs/stat.c line 82 tidak menemukan declaration
+          # karena include-nya ter-block conditional atau typo.
+          # Solusi: inject forward declaration extern langsung
           if [ -f fs/stat.c ] && ! grep -q "extern void susfs_sus_kstat_spoof_generic_fillattr" fs/stat.c; then
             python3 << 'PYEOF'
           from pathlib import Path
@@ -331,7 +330,6 @@ jobs:
           if last_include == -1:
               print("[FAIL] No #include found")
           else:
-              # Sisipkan forward declaration setelah #include terakhir
               decl_block = [
                   '',
                   '#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT',
@@ -341,13 +339,13 @@ jobs:
               ]
               lines[last_include+1:last_include+1] = decl_block
               p.write_text('\n'.join(lines))
-              print("[OK] Injected forward declaration")
+              print("[OK] Injected forward declaration untuk susfs_sus_kstat_spoof_generic_fillattr")
           PYEOF
           fi
 
           echo ""
           echo "== Verifikasi extern di fs/stat.c =="
-          grep -n "extern\|susfs_sus_kstat_spoof" fs/stat.c | head -10
+          grep -n "extern\|susfs_sus_kstat" fs/stat.c | head -10
 
       # ==========================================================
       # Buat ksu_hook.h dengan deklarasi 5 hooks (bukan stub)
@@ -597,20 +595,17 @@ jobs:
             sed -i "/$dtb/d" "$DTS_MK"
           done
 
-      - name: Debug - cek fs/stat.c dan susfs.h
+      - name: Debug - cek fs/stat.c line 70-90
         run: |
           cd kernel-src
-          echo "== fs/stat.c line 70-90 =="
-          sed -n '70,90p' fs/stat.c
+          echo "== fs/stat.c line 60-100 =="
+          sed -n '60,100p' fs/stat.c
           echo ""
-          echo "== Declaration susfs_sus_kstat_spoof_generic_fillattr di header =="
-          grep -rn "susfs_sus_kstat_spoof_generic_fillattr" include/linux/ 2>/dev/null
-          echo ""
-          echo "== Definition di fs/susfs.c =="
-          grep -n "susfs_sus_kstat_spoof_generic_fillattr" fs/susfs.c 2>/dev/null | head -5
+          echo "== Declaration susfs_sus_kstat_spoof_generic_fillattr =="
+          grep -rn "susfs_sus_kstat_spoof_generic_fillattr" include/linux/ fs/stat.c 2>/dev/null | head -10
           echo ""
           echo "== Include di fs/stat.c =="
-          grep -n "#include" fs/stat.c | head -15
+          grep -n "#include" fs/stat.c | head -20
 
       - name: Compile Kernel
         env:
