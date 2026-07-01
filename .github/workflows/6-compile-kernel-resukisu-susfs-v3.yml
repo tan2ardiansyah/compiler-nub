@@ -150,7 +150,7 @@ jobs:
       # ============================================================
       # STEP KRITIS: Extract signature ASLI dan generate ksu_hook.h yg BENAR
       # ============================================================
-      - name: 9. Extract hook signatures dari source ReSukiSU (skip yg butuh struct extra)
+      - name: 9. Extract hook signatures dan generate ksu_hook.h
         run: |
           cd kernel-src
 
@@ -164,7 +164,6 @@ jobs:
               print("[FAIL] KSU source dir not found")
               exit(1)
 
-          # Extract signatures
           signatures = {}
           for pattern in ['*.c', '*.h']:
               for f in Path(ksu_dir).rglob(pattern):
@@ -173,54 +172,47 @@ jobs:
                   except:
                       continue
                   for m in re.finditer(
-                      r'\bint\s+(ksu_handle_\w+)\s*\(([^)]*)\)\s*[;{]',
+                      r'\b(?:int|void)\s+(ksu_handle_\w+)\s*\(([^)]*)\)\s*[;{]',
                       text, re.MULTILINE
                   ):
                       name = m.group(1)
                       params = m.group(2).strip()
+                      # Determine return type
+                      full_match = m.group(0)
+                      rettype = 'int' if full_match.strip().startswith('int') else 'void'
                       if name not in signatures or '{' in text[m.end()-1:m.end()]:
-                          signatures[name] = params
+                          signatures[name] = (rettype, params)
 
-          # SKIP hook yang butuh struct non-standard
-          # (bikin warning -Wvisibility, dan kita tidak inject anyway)
-          skip_hooks = {
-              'ksu_handle_dynamic_manager',       # butuh ksu_dynamic_manager_cmd
-              'ksu_handle_get_managers_cmd',      # butuh ksu_get_managers_cmd
-              'ksu_handle_inode_event',           # butuh fsnotify_mark
-              'ksu_handle_input_handle_event',    # tidak wajib
-              'ksu_handle_stat',                  # tidak wajib
-              'ksu_handle_faccessat',             # tidak wajib
-              'ksu_handle_vfs_read',              # tidak wajib
-              'ksu_handle_execveat',              # akan di-inject terpisah
-          }
-
-          # Yang kita EXPORT hanya hook wajib
-          # (yang inline_hook_check.mk cek)
+          # Hook yang kita export ke ksu_hook.h
+          # (yang di-inject di fs/*.c dan kernel/*.c)
           wajib_hooks = {
+              'ksu_handle_execveat',
               'ksu_handle_sys_read',
               'ksu_handle_setresuid',
               'ksu_handle_sys_reboot',
           }
 
           print(f"Total extracted: {len(signatures)}")
-          print(f"Wajib untuk inline check: {wajib_hooks}")
           print()
 
-          # Generate ksu_hook.h yang minimal (hanya hook wajib)
           header = [
-              '/* Auto-generated ksu_hook.h - HANYA hook wajib (bukan semua) */',
+              '/* Auto-generated ksu_hook.h - 4 hook wajib */',
               '#ifndef __KSU_HOOK_H',
               '#define __KSU_HOOK_H',
               '',
               '#include <linux/types.h>',
               '#include <linux/uidgid.h>',
               '',
+              'struct file;',
+              'struct filename;',
+              '',
           ]
 
           for name in sorted(wajib_hooks):
               if name in signatures:
-                  header.append(f'extern int {name}({signatures[name]});')
-                  print(f"  ✓ Added: {name}({signatures[name]})")
+                  rettype, params = signatures[name]
+                  header.append(f'extern {rettype} {name}({params});')
+                  print(f"  ✓ Added: {rettype} {name}({params})")
               else:
                   print(f"  ⚠ Missing in source: {name}")
 
@@ -229,7 +221,7 @@ jobs:
 
           Path('include/linux/ksu_hook.h').write_text('\n'.join(header))
           print()
-          print("[OK] ksu_hook.h generated (minimal, only wajib hooks)")
+          print("[OK] ksu_hook.h generated")
           print()
           print("== Contents ==")
           print(Path('include/linux/ksu_hook.h').read_text())
@@ -376,7 +368,7 @@ jobs:
       # ============================================================
       # KUNCI FIX v3: Inject 3 hook WAJIB dengan signature by-value
       # ============================================================
-      - name: 12. Apply 3 hook WAJIB (by value, bukan pointer!)
+      - name: 12. Apply 4 hook WAJIB dengan signature ASLI dari source
         run: |
           cd kernel-src
 
@@ -405,37 +397,46 @@ jobs:
             fi
           }
 
-          # 1. sys_read - signature ASLI: (unsigned int fd, char __user **buf, size_t *count)
+          # 1. execveat - signature: (int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags)
+          # fs/exec.c do_execveat_common punya lokal: fd, filename, argv, envp, flags
+          add_include fs/exec.c
+          if ! grep -q "ksu_handle_execveat" fs/exec.c; then
+            inject_hook fs/exec.c "static int do_execveat_common" \
+              "ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);"
+            if ! grep -q "ksu_handle_execveat" fs/exec.c; then
+              inject_hook fs/exec.c "int do_execveat_common" \
+                "ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);"
+            fi
+          fi
+
+          # 2. sys_read - signature: (unsigned int fd, char __user **buf_ptr, size_t *count_ptr)
+          # SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
           add_include fs/read_write.c
           if ! grep -q "ksu_handle_sys_read" fs/read_write.c; then
             inject_hook fs/read_write.c "SYSCALL_DEFINE3.read" \
               "ksu_handle_sys_read(fd, &buf, &count);"
           fi
 
-          # 2. setresuid - signature ASLI: (uid_t ruid, uid_t euid, uid_t suid) BY VALUE
+          # 3. setresuid - signature: (uid_t ruid, uid_t euid, uid_t suid) BY VALUE
           add_include kernel/sys.c
           if ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
             inject_hook kernel/sys.c "SYSCALL_DEFINE3.setresuid" \
               "ksu_handle_setresuid(ruid, euid, suid);"
           fi
 
-          # 3. sys_reboot - signature ASLI: (int magic1, int magic2, unsigned int cmd, void __user **arg)
+          # 4. sys_reboot - signature: (int magic1, int magic2, unsigned int cmd, void __user **arg)
           add_include kernel/reboot.c
           if [ -f kernel/reboot.c ] && ! grep -q "ksu_handle_sys_reboot" kernel/reboot.c; then
             inject_hook kernel/reboot.c "SYSCALL_DEFINE4.reboot" \
               "ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);"
           fi
 
-          echo "== Verifikasi 3 hook wajib =="
-          for f in fs/read_write.c kernel/sys.c kernel/reboot.c; do
+          echo "== Verifikasi 4 hook wajib =="
+          for f in fs/exec.c fs/read_write.c kernel/sys.c kernel/reboot.c; do
             [ -f "$f" ] || continue
             HOOKS=$(grep -o "ksu_handle_[a-z_]*" "$f" 2>/dev/null | sort -u | tr '\n' ' ')
             echo "  $f -> ${HOOKS:-NONE}"
           done
-
-          echo ""
-          echo "== fs/exec.c current state =="
-          grep -n "ksu_handle\|ksud" fs/exec.c | head -10 || echo "(no ksu references)"
 
       - name: 13. Prepare defconfig
         run: |
