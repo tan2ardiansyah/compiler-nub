@@ -139,13 +139,35 @@ jobs:
           echo "== Verifikasi =="
           ls -la drivers/kernelsu || true
           grep -n "kernelsu" drivers/Makefile || true
-          grep -n "kernelsu" drivers/Kconfig || true
 
           KSU_ROOT_DIR=""
           for d in KernelSU KernelSU-Next ReSukiSU; do
             [ -d "$d" ] && { KSU_ROOT_DIR="$d"; break; }
           done
           echo "KSU_ROOT_DIR=$KSU_ROOT_DIR" >> "$GITHUB_ENV"
+
+          # ==========================================================
+          # Deteksi mode hook ReSukiSU
+          # ==========================================================
+          # ReSukiSU v4.1+ punya 2 mode:
+          # - SuSFS Inline hook: pakai ksud.h, setup.sh sudah inject
+          #   hook ke fs/exec.c dll secara otomatis
+          # - Manual hook: pakai ksu_hook.h, kita harus inject sendiri
+          #
+          # Cek dengan lihat apakah ksud.h sudah ada SETELAH setup.sh
+          # ==========================================================
+          if [ -f include/linux/ksud.h ]; then
+            echo "HOOK_MODE=inline" >> "$GITHUB_ENV"
+            echo "ReSukiSU mode: SuSFS INLINE hook (ksud.h ditemukan)"
+            echo "Manual hook injection TIDAK diperlukan untuk fs/exec.c dll"
+          else
+            echo "HOOK_MODE=manual" >> "$GITHUB_ENV"
+            echo "ReSukiSU mode: MANUAL hook (ksud.h tidak ada)"
+          fi
+
+          echo "== Headers ReSukiSU yang ada =="
+          find include/linux -name "ksu*" -o -name "ksud*" 2>/dev/null | sort
+          find KernelSU KernelSU-Next 2>/dev/null -name "*.h" | head -10
 
       - name: Integrate SUSFS
         run: |
@@ -165,19 +187,31 @@ jobs:
           set -e
 
           echo ""
-          echo "-- Hunks succeeded --"
-          grep -c "succeeded" /tmp/susfs.log || echo "0"
-          echo "-- Hunks FAILED --"
-          grep -c "FAILED" /tmp/susfs.log || echo "0"
+          echo "-- Hunks succeeded: $(grep -c 'succeeded' /tmp/susfs.log || echo 0)"
+          echo "-- Hunks FAILED   : $(grep -c 'FAILED' /tmp/susfs.log || echo 0)"
           echo ""
           echo "-- FAILED details --"
           grep "FAILED" /tmp/susfs.log || echo "(none)"
+
+          echo ""
+          echo "== Isi .rej files =="
+          for rej in \
+            fs/proc/task_mmu.c.rej \
+            fs/proc_namespace.c.rej \
+            fs/stat.c.rej \
+            fs/Makefile.rej; do
+            if [ -f "$rej" ]; then
+              echo "---- $rej ----"
+              cat "$rej"
+              echo ""
+            fi
+          done
 
           find . -name "*.rej" -not -path "./.susfs4ksu/*" -delete 2>/dev/null || true
           find . -name "*.orig" -not -path "./.susfs4ksu/*" -delete 2>/dev/null || true
 
           echo ""
-          echo "== [3/3] Copy sus_su.c dan file SUSFS yg belum ada =="
+          echo "== [3/3] Copy file SUSFS yang belum ada =="
           if [ ! -f fs/sus_su.c ] && [ -f .susfs4ksu/kernel_patches/fs/sus_su.c ]; then
             cp -v .susfs4ksu/kernel_patches/fs/sus_su.c fs/sus_su.c
           fi
@@ -192,161 +226,263 @@ jobs:
           fi
 
           echo ""
-          echo "== SUSFS files final =="
+          echo "== SUSFS files =="
           ls -la fs/susfs.c fs/sus_su.c include/linux/susfs.h include/linux/susfs_def.h 2>/dev/null || true
 
-      - name: Fix SUSFS missing includes
+      - name: Fix SUSFS rejected hunks
         run: |
           cd kernel-src
 
-          if [ -f fs/Makefile ]; then
-            if ! grep -q "susfs.o" fs/Makefile; then
-              sed -i '0,/^obj-y[[:space:]]*+=/{s|^obj-y[[:space:]]*+=.*|&\nobj-y += susfs.o sus_su.o|}' fs/Makefile
-              echo "[OK] Added susfs.o sus_su.o to fs/Makefile"
-            fi
+          # Fix fs/Makefile: tambah susfs.o dan sus_su.o
+          if [ -f fs/Makefile ] && ! grep -q "susfs.o" fs/Makefile; then
+            sed -i '0,/^obj-y[[:space:]]*+=/{s|^obj-y[[:space:]]*+=.*|&\nobj-y += susfs.o sus_su.o|}' fs/Makefile
+            echo "[OK] fs/Makefile: added susfs.o sus_su.o"
           fi
 
+          # Fix fs/proc_namespace.c: hunk #1 gagal = include tidak masuk
+          # Tambah include susfs.h
           if [ -f fs/proc_namespace.c ] && ! grep -q "linux/susfs" fs/proc_namespace.c; then
             sed -i '/^#include <linux\/fs\.h>/a #include <linux/susfs.h>\n#include <linux/susfs_def.h>' fs/proc_namespace.c
-            echo "[OK] Added susfs includes to fs/proc_namespace.c"
+            echo "[OK] fs/proc_namespace.c: added susfs includes"
           fi
 
+          # Fix fs/stat.c: hunk #3 gagal = susfs_sus_kstat_spoof tidak masuk
+          # Tambah include susfs.h
           if [ -f fs/stat.c ] && ! grep -q "linux/susfs" fs/stat.c; then
             sed -i '/^#include <linux\/fs\.h>/a #include <linux/susfs.h>\n#include <linux/susfs_def.h>' fs/stat.c
-            echo "[OK] Added susfs includes to fs/stat.c"
+            echo "[OK] fs/stat.c: added susfs includes"
           fi
 
+          # Fix fs/proc/cmdline.c
           if [ -f fs/proc/cmdline.c ] && ! grep -q "linux/susfs" fs/proc/cmdline.c; then
             sed -i '/^#include <linux\/fs\.h>/a #include <linux/susfs.h>' fs/proc/cmdline.c
-            echo "[OK] Added susfs include to fs/proc/cmdline.c"
+            echo "[OK] fs/proc/cmdline.c: added susfs include"
           fi
 
+          # Fix fs/proc/task_mmu.c: tambah include
           if [ -f fs/proc/task_mmu.c ] && ! grep -q "linux/susfs" fs/proc/task_mmu.c; then
             sed -i '/^#include <linux\/fs\.h>/a #include <linux/susfs.h>\n#include <linux/susfs_def.h>' fs/proc/task_mmu.c
-            echo "[OK] Added susfs includes to fs/proc/task_mmu.c"
+            echo "[OK] fs/proc/task_mmu.c: added susfs includes"
           fi
 
           echo ""
-          echo "== Verifikasi include susfs =="
-          for f in fs/proc_namespace.c fs/stat.c fs/proc/cmdline.c fs/proc/task_mmu.c fs/Makefile; do
-            if [ -f "$f" ]; then
-              echo "-- $f --"
-              grep -n "susfs" "$f" | head -5 || echo "  (no susfs reference)"
-            fi
+          echo "== Verifikasi =="
+          for f in fs/Makefile fs/stat.c fs/proc_namespace.c fs/proc/task_mmu.c fs/proc/cmdline.c; do
+            [ -f "$f" ] && echo "  $f: $(grep -c 'susfs' "$f" 2>/dev/null || echo 0) susfs refs"
           done
 
-      - name: Detect KSU hook header
+      # ==========================================================
+      # Detect hook mode dan apply hooks sesuai mode
+      # ==========================================================
+      - name: Detect KSU hook mode dan header
         run: |
           cd kernel-src
-          set -e
 
-          if [ -f include/linux/ksu_hook.h ]; then
-            echo "KSU_HEADER=linux/ksu_hook.h" >> "$GITHUB_ENV"
-            echo "[OK] Found: include/linux/ksu_hook.h"
-            exit 0
+          echo "HOOK_MODE saat ini: ${{ env.HOOK_MODE }}"
+          echo ""
+
+          # Re-deteksi untuk memastikan (env dari job sebelumnya)
+          if [ -f include/linux/ksud.h ]; then
+            echo "HOOK_MODE=inline" >> "$GITHUB_ENV"
+            echo "[INFO] Mode: SuSFS INLINE"
+            echo "  ksud.h ditemukan - setup.sh sudah handle hook ke fs/exec.c dll"
+            echo "  Kita hanya perlu tambah setresuid hook di kernel/sys.c"
+            echo "KSU_HEADER=linux/ksud.h" >> "$GITHUB_ENV"
+          else
+            echo "HOOK_MODE=manual" >> "$GITHUB_ENV"
+            echo "[INFO] Mode: MANUAL hook"
+
+            FOUND=$(find KernelSU KernelSU-Next drivers/kernelsu .resukisu-src 2>/dev/null \
+                    -type f -name 'ksu_hook.h' | head -n 1 || true)
+            if [ -n "$FOUND" ]; then
+              cp -f "$FOUND" include/linux/ksu_hook.h
+              echo "KSU_HEADER=linux/ksu_hook.h" >> "$GITHUB_ENV"
+              echo "[OK] Copied ksu_hook.h"
+            else
+              ALT=$(find KernelSU KernelSU-Next drivers/kernelsu .resukisu-src 2>/dev/null \
+                    -type f -name '*.h' -exec grep -l 'ksu_handle_execveat' {} \; \
+                    | head -n 1 || true)
+              if [ -n "$ALT" ]; then
+                BNAME=$(basename "$ALT")
+                cp -f "$ALT" "include/linux/$BNAME"
+                echo "KSU_HEADER=linux/$BNAME" >> "$GITHUB_ENV"
+                echo "[OK] Alternative header: $BNAME"
+              else
+                echo "[FATAL] Tidak ada header manual hook"
+                exit 1
+              fi
+            fi
           fi
 
-          FOUND=$(find KernelSU KernelSU-Next drivers/kernelsu .resukisu-src 2>/dev/null -type f -name 'ksu_hook.h' | head -n 1 || true)
-          if [ -n "$FOUND" ]; then
-            cp -f "$FOUND" include/linux/ksu_hook.h
-            echo "KSU_HEADER=linux/ksu_hook.h" >> "$GITHUB_ENV"
-            echo "[OK] Copied: $FOUND"
-            exit 0
-          fi
+          echo ""
+          echo "== Semua header KSU di include/linux =="
+          find include/linux -name "ksu*" -o -name "ksud*" 2>/dev/null | sort
 
-          ALT=$(find KernelSU KernelSU-Next drivers/kernelsu .resukisu-src 2>/dev/null -type f -name '*.h' -exec grep -l 'ksu_handle_execveat' {} \; | head -n 1 || true)
-          if [ -n "$ALT" ]; then
-            BNAME=$(basename "$ALT")
-            cp -f "$ALT" "include/linux/$BNAME"
-            echo "KSU_HEADER=linux/$BNAME" >> "$GITHUB_ENV"
-            echo "[OK] Alternative: $ALT"
-            exit 0
-          fi
-
-          echo "[FATAL] Header ksu_hook.h tidak ditemukan"
-          exit 1
-
-      - name: Apply ReSukiSU manual hooks
+      - name: Apply ReSukiSU hooks
         run: |
           cd kernel-src
+          HOOK_MODE="${{ env.HOOK_MODE }}"
           KSU_HEADER="${{ env.KSU_HEADER }}"
-          echo "Using header: $KSU_HEADER"
 
-          # Helper: tambah include header ke file
-          add_include() {
+          echo "Hook mode  : $HOOK_MODE"
+          echo "KSU header : $KSU_HEADER"
+          echo ""
+
+          # awk inject helper - YAML safe, tidak ada backslash multiline
+          inject_after_open_brace() {
             local file="$1"
-            if [ ! -f "$file" ]; then return; fi
-            if ! grep -q "linux/version.h" "$file"; then
-              sed -i '0,/^#include/s||#include <linux/version.h>\n&|' "$file"
-            fi
-            if ! grep -q "$KSU_HEADER" "$file"; then
-              sed -i "0,/^#include/s||#include <$KSU_HEADER>\n&|" "$file"
-            fi
-          }
-
-          # Helper: inject hook setelah opening brace fungsi
-          # Args: $1=file, $2=pattern function, $3=hook code
-          inject_hook() {
-            local file="$1"
-            local func_pat="$2"
-            local hook_code="$3"
-            if [ ! -f "$file" ]; then return; fi
-
-            # Buat awk script yang cari pattern function lalu inject setelah "{"
-            awk -v pat="$func_pat" -v hook="$hook_code" '
-              $0 ~ pat { found=1 }
-              found && /^\{/ && !injected {
+            local func_pattern="$2"
+            local hook_line="$3"
+            if [ ! -f "$file" ]; then return 1; fi
+            awk -v pat="$func_pattern" -v hook="$hook_line" '
+              $0 ~ pat { in_func=1 }
+              in_func && /^\{/ && !done {
                 print
                 print "\t/* ReSukiSU hook */"
                 print "\t" hook
-                injected=1
-                found=0
+                done=1
+                in_func=0
                 next
               }
               { print }
-            ' "$file" > "$file.new" && mv "$file.new" "$file"
+            ' "$file" > "$file.tmp" && mv "$file.tmp" "$file"
           }
 
-          # Hook 1: fs/exec.c -> ksu_handle_execveat
-          add_include fs/exec.c
-          if [ -f fs/exec.c ] && ! grep -q "ksu_handle_execveat" fs/exec.c; then
-            inject_hook fs/exec.c "static int do_execveat_common" "ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);"
-            echo "[OK] Hooked fs/exec.c"
-          fi
+          if [ "$HOOK_MODE" = "inline" ]; then
+            echo "========================================"
+            echo "MODE: SuSFS INLINE"
+            echo "========================================"
+            echo "setup.sh sudah inject hook ke fs/exec.c, fs/open.c, dll"
+            echo "via ksud.h mekanisme."
+            echo ""
+            echo "Yang perlu kita tambahkan:"
+            echo "  1. ksu_handle_setresuid di kernel/sys.c"
+            echo "  2. ksu_handle_input_handle_event di drivers/input/input.c"
+            echo "     (kalau belum ada)"
+            echo ""
 
-          # Hook 2: fs/open.c -> ksu_handle_faccessat
-          add_include fs/open.c
-          if [ -f fs/open.c ] && ! grep -q "ksu_handle_faccessat" fs/open.c; then
-            inject_hook fs/open.c "long do_faccessat" "ksu_handle_faccessat(&dfd, &filename, &mode, NULL);"
-            echo "[OK] Hooked fs/open.c"
-          fi
+            # Cek apakah inline hook sudah inject ke fs/exec.c
+            echo "== Cek inline hook di fs/exec.c =="
+            grep -n "ksu_handle\|ksud" fs/exec.c | head -10 || echo "(tidak ada)"
+            echo ""
 
-          # Hook 3: fs/read_write.c -> ksu_handle_vfs_read
-          add_include fs/read_write.c
-          if [ -f fs/read_write.c ] && ! grep -q "ksu_handle_vfs_read" fs/read_write.c; then
-            inject_hook fs/read_write.c "ssize_t vfs_read" "ksu_handle_vfs_read(&file, &buf, &count, &pos);"
-            echo "[OK] Hooked fs/read_write.c"
-          fi
+            # Cek ksu_handle_setresuid di kernel/sys.c
+            echo "== Cek kernel/sys.c =="
+            grep -n "ksu_handle_setresuid\|setresuid" kernel/sys.c | head -5 || true
+            echo ""
 
-          # Hook 4: fs/stat.c -> ksu_handle_stat (PENTING: flag bukan flags)
-          add_include fs/stat.c
-          if [ -f fs/stat.c ] && ! grep -q "ksu_handle_stat" fs/stat.c; then
-            inject_hook fs/stat.c "int vfs_fstatat" "ksu_handle_stat(&dfd, &filename, &flag);"
-            echo "[OK] Hooked fs/stat.c"
-          fi
+            # Untuk inline mode, kita perlu tambah setresuid hook
+            # Cari deklarasi yang benar di ksud.h
+            echo "== Deklarasi di ksud.h =="
+            cat include/linux/ksud.h 2>/dev/null || echo "(ksud.h tidak ada)"
+            echo ""
 
-          # Hook 5: drivers/input/input.c -> ksu_handle_input_handle_event
-          add_include drivers/input/input.c
-          if [ -f drivers/input/input.c ] && ! grep -q "ksu_handle_input_handle_event" drivers/input/input.c; then
-            inject_hook drivers/input/input.c "void input_handle_event" "ksu_handle_input_handle_event(&type, &code, &value);"
-            echo "[OK] Hooked drivers/input/input.c"
-          fi
+            # Tambah setresuid hook ke kernel/sys.c
+            if [ -f kernel/sys.c ] && ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
+              if ! grep -q "linux/ksud.h" kernel/sys.c; then
+                sed -i '0,/^#include/s||#include <linux/ksud.h>\n&|' kernel/sys.c
+              fi
+              inject_after_open_brace kernel/sys.c \
+                "SYSCALL_DEFINE3.setresuid" \
+                "ksu_handle_setresuid(&ruid, &euid, &suid);"
+              echo "[OK] Injected setresuid hook ke kernel/sys.c"
+            else
+              echo "[SKIP] setresuid hook sudah ada di kernel/sys.c"
+            fi
 
-          # Hook 6: kernel/sys.c -> ksu_handle_setresuid (WAJIB ReSukiSU v4.1+)
-          add_include kernel/sys.c
-          if [ -f kernel/sys.c ] && ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
-            inject_hook kernel/sys.c "SYSCALL_DEFINE3.setresuid" "ksu_handle_setresuid(&ruid, &euid, &suid);"
-            echo "[OK] Hooked kernel/sys.c"
+            # Tambah input hook kalau belum ada
+            if [ -f drivers/input/input.c ] && ! grep -q "ksu_handle_input_handle_event" drivers/input/input.c; then
+              if ! grep -q "linux/ksud.h" drivers/input/input.c; then
+                sed -i '0,/^#include/s||#include <linux/ksud.h>\n&|' drivers/input/input.c
+              fi
+              inject_after_open_brace drivers/input/input.c \
+                "void input_handle_event" \
+                "ksu_handle_input_handle_event(&type, &code, &value);"
+              if ! grep -q "ksu_handle_input_handle_event" drivers/input/input.c; then
+                inject_after_open_brace drivers/input/input.c \
+                  "static void input_handle_event" \
+                  "ksu_handle_input_handle_event(&type, &code, &value);"
+              fi
+              echo "[OK] Injected input hook ke drivers/input/input.c"
+            else
+              echo "[SKIP] input hook sudah ada atau file tidak ada"
+            fi
+
+          else
+            echo "========================================"
+            echo "MODE: MANUAL hook"
+            echo "========================================"
+            echo "Inject semua 6 hooks manual"
+            echo ""
+
+            add_include() {
+              local file="$1"
+              local hdr="$2"
+              if [ ! -f "$file" ]; then return; fi
+              if ! grep -q "linux/version.h" "$file"; then
+                sed -i '0,/^#include/s||#include <linux/version.h>\n&|' "$file"
+              fi
+              if ! grep -q "$hdr" "$file"; then
+                sed -i "0,/^#include/s||#include <$hdr>\n&|" "$file"
+              fi
+            }
+
+            # Hook 1: fs/exec.c
+            add_include fs/exec.c "$KSU_HEADER"
+            if ! grep -q "ksu_handle_execveat" fs/exec.c; then
+              inject_after_open_brace fs/exec.c \
+                "static int do_execveat_common" \
+                "ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);"
+              echo "[OK] Hooked fs/exec.c"
+            fi
+
+            # Hook 2: fs/open.c
+            add_include fs/open.c "$KSU_HEADER"
+            if ! grep -q "ksu_handle_faccessat" fs/open.c; then
+              inject_after_open_brace fs/open.c \
+                "long do_faccessat" \
+                "ksu_handle_faccessat(&dfd, &filename, &mode, NULL);"
+              echo "[OK] Hooked fs/open.c"
+            fi
+
+            # Hook 3: fs/read_write.c
+            add_include fs/read_write.c "$KSU_HEADER"
+            if ! grep -q "ksu_handle_vfs_read" fs/read_write.c; then
+              inject_after_open_brace fs/read_write.c \
+                "ssize_t vfs_read" \
+                "ksu_handle_vfs_read(&file, &buf, &count, &pos);"
+              echo "[OK] Hooked fs/read_write.c"
+            fi
+
+            # Hook 4: fs/stat.c (flag bukan flags)
+            add_include fs/stat.c "$KSU_HEADER"
+            if ! grep -q "ksu_handle_stat" fs/stat.c; then
+              inject_after_open_brace fs/stat.c \
+                "int vfs_fstatat" \
+                "ksu_handle_stat(&dfd, &filename, &flag);"
+              echo "[OK] Hooked fs/stat.c"
+            fi
+
+            # Hook 5: drivers/input/input.c
+            add_include drivers/input/input.c "$KSU_HEADER"
+            if ! grep -q "ksu_handle_input_handle_event" drivers/input/input.c; then
+              inject_after_open_brace drivers/input/input.c \
+                "void input_handle_event" \
+                "ksu_handle_input_handle_event(&type, &code, &value);"
+              inject_after_open_brace drivers/input/input.c \
+                "static void input_handle_event" \
+                "ksu_handle_input_handle_event(&type, &code, &value);"
+              echo "[OK] Hooked drivers/input/input.c"
+            fi
+
+            # Hook 6: kernel/sys.c
+            add_include kernel/sys.c "$KSU_HEADER"
+            if ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
+              inject_after_open_brace kernel/sys.c \
+                "SYSCALL_DEFINE3.setresuid" \
+                "ksu_handle_setresuid(&ruid, &euid, &suid);"
+              echo "[OK] Hooked kernel/sys.c"
+            fi
           fi
 
           echo ""
@@ -420,7 +556,6 @@ jobs:
           cd kernel-src
           DTS_MK="arch/arm64/boot/dts/qcom/Makefile"
           [ -f "$DTS_MK" ] || exit 0
-
           for dtb in sdm845-v2-qvr-evt.dtb sdm845-v2-qvr-dvt.dtb sdm845-interposer-sdm670-mtp.dtb sdm845-interposer-sdm670-cdp.dtb; do
             sed -i "/$dtb/d" "$DTS_MK"
           done
