@@ -1,4 +1,4 @@
-name: 6. Compile Kernel v3 - BOS Beryllium + ReSukiSU + SUSFS (fix signature)
+name: 6. Compile Kernel v3 - BOS Beryllium + ReSukiSU + SUSFS (fix all hooks)
 
 on:
   workflow_dispatch:
@@ -125,9 +125,9 @@ jobs:
           fi
 
       # ============================================================
-      # STEP KRITIS: Debug apa yang setup.sh lakukan ke fs/exec.c
+      # STEP 8: Debug fs/exec.c setelah setup.sh
       # ============================================================
-      - name: 8. DEBUG - inspect fs/exec.c setelah setup.sh + cari execveat implementation
+      - name: 8. DEBUG - inspect fs/exec.c setelah setup.sh + cari execveat
         run: |
           cd kernel-src
 
@@ -148,9 +148,26 @@ jobs:
           grep -rn "ksu_handle_execveat_ksud" KernelSU/ 2>/dev/null | head -5
 
       # ============================================================
-      # STEP KRITIS: Extract signature ASLI dan generate ksu_hook.h yg BENAR
+      # STEP 8b: Debug tambahan - cari SEMUA signature ksu_handle
       # ============================================================
-      - name: 9. Extract hook signatures dan generate ksu_hook.h
+      - name: 8b. DEBUG - cari semua signature ksu_handle di source
+        run: |
+          cd kernel-src
+          echo "== SEMUA implementasi ksu_handle_* di source ReSukiSU =="
+          grep -rn "^int ksu_handle_\|^void ksu_handle_" KernelSU/ 2>/dev/null | head -30
+
+          echo ""
+          echo "== Cari khusus faccessat =="
+          grep -rn "ksu_handle_faccessat" KernelSU/ 2>/dev/null | head -10
+
+          echo ""
+          echo "== Cari khusus stat, vfs_read, input_handle_event =="
+          grep -rn "int ksu_handle_stat\|int ksu_handle_vfs_read\|int ksu_handle_input" KernelSU/ 2>/dev/null | head -10
+
+      # ============================================================
+      # STEP 9: Generate ksu_hook.h dari signature ASLI (5 hooks)
+      # ============================================================
+      - name: 9. Extract hook signatures dan generate ksu_hook.h (5 hooks)
         run: |
           cd kernel-src
 
@@ -177,16 +194,16 @@ jobs:
                   ):
                       name = m.group(1)
                       params = m.group(2).strip()
-                      # Determine return type
                       full_match = m.group(0)
                       rettype = 'int' if full_match.strip().startswith('int') else 'void'
                       if name not in signatures or '{' in text[m.end()-1:m.end()]:
                           signatures[name] = (rettype, params)
 
-          # Hook yang kita export ke ksu_hook.h
-          # (yang di-inject di fs/*.c dan kernel/*.c)
+          # Hook WAJIB yang harus di-inject di kernel source
+          # (yang inline_hook_check.mk butuh)
           wajib_hooks = {
               'ksu_handle_execveat',
+              'ksu_handle_faccessat',
               'ksu_handle_sys_read',
               'ksu_handle_setresuid',
               'ksu_handle_sys_reboot',
@@ -194,9 +211,14 @@ jobs:
 
           print(f"Total extracted: {len(signatures)}")
           print()
+          print("== Semua ksu_handle_* di source ==")
+          for name in sorted(signatures.keys()):
+              rettype, params = signatures[name]
+              print(f"  {rettype} {name}({params})")
+          print()
 
           header = [
-              '/* Auto-generated ksu_hook.h - 4 hook wajib */',
+              '/* Auto-generated ksu_hook.h - 5 hook wajib */',
               '#ifndef __KSU_HOOK_H',
               '#define __KSU_HOOK_H',
               '',
@@ -227,6 +249,9 @@ jobs:
           print(Path('include/linux/ksu_hook.h').read_text())
           PYEOF
 
+      # ============================================================
+      # STEP 10: Clone SUSFS & apply patch
+      # ============================================================
       - name: 10. Clone SUSFS & apply patch
         run: |
           cd kernel-src
@@ -246,7 +271,10 @@ jobs:
             cp .susfs4ksu/kernel_patches/fs/sus_su.c fs/sus_su.c
           fi
 
-      - name: 11. Manual fix SUSFS hunks (sama seperti v1 yg berhasil)
+      # ============================================================
+      # STEP 11: Manual fix SUSFS hunks (sama seperti v1 yg berhasil)
+      # ============================================================
+      - name: 11. Manual fix SUSFS hunks
         run: |
           cd kernel-src
 
@@ -366,9 +394,9 @@ jobs:
           fi
 
       # ============================================================
-      # KUNCI FIX v3: Inject 3 hook WAJIB dengan signature by-value
+      # STEP 12: Inject 5 hook WAJIB dengan signature ASLI
       # ============================================================
-      - name: 12. Apply 4 hook WAJIB dengan signature ASLI dari source
+      - name: 12. Apply 5 hook WAJIB dengan signature ASLI dari source
         run: |
           cd kernel-src
 
@@ -398,7 +426,7 @@ jobs:
           }
 
           # 1. execveat - signature: (int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags)
-          # fs/exec.c do_execveat_common punya lokal: fd, filename, argv, envp, flags
+          # do_execveat_common punya lokal: fd, filename, argv, envp, flags
           add_include fs/exec.c
           if ! grep -q "ksu_handle_execveat" fs/exec.c; then
             inject_hook fs/exec.c "static int do_execveat_common" \
@@ -409,35 +437,47 @@ jobs:
             fi
           fi
 
-          # 2. sys_read - signature: (unsigned int fd, char __user **buf_ptr, size_t *count_ptr)
-          # SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
+          # 2. faccessat - signature standar: (int *dfd, struct filename **filename_ptr, int *mode, int *flags)
+          # SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
+          # kernel 4.9 fs/open.c: dfd (int), filename (const char __user *), mode (int)
+          # Cast filename ke (struct filename **), flags NULL karena tidak ada param
+          add_include fs/open.c
+          if ! grep -q "ksu_handle_faccessat" fs/open.c; then
+            inject_hook fs/open.c "SYSCALL_DEFINE3.faccessat" \
+              "ksu_handle_faccessat(&dfd, (struct filename **)&filename, &mode, NULL);"
+          fi
+
+          # 3. sys_read - signature: (unsigned int fd, char __user **buf_ptr, size_t *count_ptr)
           add_include fs/read_write.c
           if ! grep -q "ksu_handle_sys_read" fs/read_write.c; then
             inject_hook fs/read_write.c "SYSCALL_DEFINE3.read" \
               "ksu_handle_sys_read(fd, &buf, &count);"
           fi
 
-          # 3. setresuid - signature: (uid_t ruid, uid_t euid, uid_t suid) BY VALUE
+          # 4. setresuid - signature: (uid_t ruid, uid_t euid, uid_t suid) BY VALUE
           add_include kernel/sys.c
           if ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
             inject_hook kernel/sys.c "SYSCALL_DEFINE3.setresuid" \
               "ksu_handle_setresuid(ruid, euid, suid);"
           fi
 
-          # 4. sys_reboot - signature: (int magic1, int magic2, unsigned int cmd, void __user **arg)
+          # 5. sys_reboot - signature: (int magic1, int magic2, unsigned int cmd, void __user **arg)
           add_include kernel/reboot.c
           if [ -f kernel/reboot.c ] && ! grep -q "ksu_handle_sys_reboot" kernel/reboot.c; then
             inject_hook kernel/reboot.c "SYSCALL_DEFINE4.reboot" \
               "ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);"
           fi
 
-          echo "== Verifikasi 4 hook wajib =="
-          for f in fs/exec.c fs/read_write.c kernel/sys.c kernel/reboot.c; do
+          echo "== Verifikasi 5 hook wajib =="
+          for f in fs/exec.c fs/open.c fs/read_write.c kernel/sys.c kernel/reboot.c; do
             [ -f "$f" ] || continue
             HOOKS=$(grep -o "ksu_handle_[a-z_]*" "$f" 2>/dev/null | sort -u | tr '\n' ' ')
             echo "  $f -> ${HOOKS:-NONE}"
           done
 
+      # ============================================================
+      # STEP 13: Prepare defconfig
+      # ============================================================
       - name: 13. Prepare defconfig
         run: |
           cd kernel-src
@@ -517,7 +557,55 @@ jobs:
           echo "BUILD_OK=$BUILD_OK" >> "$GITHUB_ENV"
           [ "$BUILD_OK" -eq 1 ] || exit 1
 
-      - name: 17. Upload build log (selalu)
+      - name: 17. Extract versions
+        if: always()
+        run: |
+          cd kernel-src
+          RESUKISU_CODE=$(grep -oP "ReSukiSU version code:\s*\K[0-9]+" build.log | head -1 || echo "unknown")
+          RESUKISU_NAME=$(grep -oP "ReSukiSU version name:\s*\K\S+" build.log | head -1 || echo "unknown")
+          SUSFS_VER=$(grep -oP "SUSFS_VERSION:\s*\Kv[0-9.]+" build.log | head -1 || echo "unknown")
+          echo "RESUKISU_VERSION_CODE=${RESUKISU_CODE}" >> "$GITHUB_ENV"
+          echo "RESUKISU_VERSION_NAME=${RESUKISU_NAME}" >> "$GITHUB_ENV"
+          echo "SUSFS_VERSION=${SUSFS_VER}" >> "$GITHUB_ENV"
+
+      - name: 18. Capture metadata
+        if: env.BUILD_OK == '1'
+        run: |
+          cd kernel-src
+          KERNEL_COMMIT=$(git rev-parse --short HEAD)
+          RESUKISU_COMMIT="unknown"
+          [ -d KernelSU ] && RESUKISU_COMMIT=$(cd KernelSU && git rev-parse --short HEAD 2>/dev/null || echo "embedded")
+          [ -d .resukisu-src ] && [ "$RESUKISU_COMMIT" = "unknown" ] && \
+            RESUKISU_COMMIT=$(cd .resukisu-src && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+          SUSFS_COMMIT=$(cd .susfs4ksu && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+
+          cat > ../build-metadata.json << JSONEOF
+          {
+            "build_date": "$(date -u '+%Y-%m-%d %H:%M UTC')",
+            "kernel": {
+              "source": "${{ github.event.inputs.kernel_source }}",
+              "branch": "${{ github.event.inputs.kernel_branch }}",
+              "commit": "${KERNEL_COMMIT}",
+              "version": "$(cat out/include/config/kernel.release)",
+              "defconfig": "${{ github.event.inputs.defconfig }}"
+            },
+            "resukisu": {
+              "repo": "${{ github.event.inputs.resukisu_repo }}",
+              "branch": "${{ github.event.inputs.resukisu_branch }}",
+              "commit": "${RESUKISU_COMMIT}",
+              "version_code": "${RESUKISU_VERSION_CODE}",
+              "version_name": "${RESUKISU_VERSION_NAME}"
+            },
+            "susfs": {
+              "branch": "${{ github.event.inputs.susfs_branch }}",
+              "commit": "${SUSFS_COMMIT}",
+              "version": "${SUSFS_VERSION}"
+            }
+          }
+          JSONEOF
+          cat ../build-metadata.json | jq .
+
+      - name: 19. Upload build log (selalu)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -525,10 +613,18 @@ jobs:
           path: kernel-src/build.log
           retention-days: 7
 
-      - name: 18. Upload Image
+      - name: 20. Upload Image
         if: env.BUILD_OK == '1'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.inputs.zip_name }}-gz-dtb
           path: kernel-src/out/arch/arm64/boot/Image.gz-dtb
+          retention-days: 30
+
+      - name: 21. Upload metadata
+        if: env.BUILD_OK == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-metadata
+          path: build-metadata.json
           retention-days: 30
