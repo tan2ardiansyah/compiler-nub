@@ -1,0 +1,100 @@
+      - name: Compile Kernel
+        run: |
+          cd kernel-src
+          OUT_DIR="out"
+          
+          # ============================================================
+          # KUNCI FIX v9.4: 
+          # 1. PATH sistem duluan (biar as/ld sistem yang dipakai)
+          # 2. Proton di paling akhir PATH (biar clang tetap ketemu)
+          # 3. Absolute path untuk semua Clang tools
+          # ============================================================
+          export PATH="/usr/bin:/bin:$HOME/clang-ext/bin"
+          
+          # Bersihkan binary Proton yang konflik dengan sistem
+          # (biar tidak dipanggil, sistem tools yang benar dipakai)
+          echo "== Bersihkan binary Proton yang konflik dengan sistem =="
+          for bin in as ld ar nm objcopy objdump strip readelf; do
+            if [ -f "$HOME/clang-ext/bin/$bin" ]; then
+              mv "$HOME/clang-ext/bin/$bin" "$HOME/clang-ext/bin/$bin.proton" 2>/dev/null && \
+                echo "  Moved: $bin → $bin.proton"
+            fi
+          done
+          
+          echo ""
+          echo "== Verify tools resolution =="
+          which as && echo "  as → $(readlink -f $(which as))"
+          which ld && echo "  ld → $(readlink -f $(which ld))"
+          which gcc && echo "  gcc → $(readlink -f $(which gcc))"
+          which clang && echo "  clang → $(readlink -f $(which clang))"
+          
+          echo ""
+          echo "== Clang version =="
+          clang --version
+          
+          echo ""
+          echo "== Host toolchain =="
+          gcc --version | head -1
+          ld --version | head -1
+
+          # ABSOLUTE PATH untuk semua Clang/LLVM tools
+          # Ini bikin kernel Makefile pakai Proton clang untuk target compile,
+          # tapi as/ld/dll pakai sistem
+          CLANG_PATH="$HOME/clang-ext/bin"
+
+          MAKE_ARGS=(
+            O=$OUT_DIR
+            ARCH=arm64
+            CC=${CLANG_PATH}/clang
+            LD=${CLANG_PATH}/ld.lld.proton
+            AR=${CLANG_PATH}/llvm-ar
+            NM=${CLANG_PATH}/llvm-nm
+            OBJCOPY=${CLANG_PATH}/llvm-objcopy
+            OBJDUMP=${CLANG_PATH}/llvm-objdump
+            STRIP=${CLANG_PATH}/llvm-strip
+            READELF=${CLANG_PATH}/llvm-readelf
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            LLVM=1
+            LLVM_IAS=1
+            HOSTCC=/usr/bin/gcc
+            HOSTCXX=/usr/bin/g++
+            HOSTLD=/usr/bin/ld
+            HOSTAR=/usr/bin/ar
+            HOSTCFLAGS="-fcommon"
+            KCFLAGS="-Wno-error"
+          )
+
+          # Cek dulu apakah ld.lld.proton ada (kita rename tadi)
+          # Kalau tidak, coba nama lain
+          if [ ! -f "${CLANG_PATH}/ld.lld.proton" ]; then
+            if [ -f "${CLANG_PATH}/ld.lld" ]; then
+              MAKE_ARGS=("${MAKE_ARGS[@]/LD=${CLANG_PATH}/ld.lld.proton/LD=${CLANG_PATH}/ld.lld}")
+            fi
+          fi
+
+          mkdir -p $OUT_DIR
+          make "${MAKE_ARGS[@]}" ${{ github.event.inputs.defconfig }}
+          make "${MAKE_ARGS[@]}" olddefconfig
+
+          echo "== Config final =="
+          for cfg in CONFIG_KSU CONFIG_KSU_KPROBE_HOOKS CONFIG_UTS_NS CONFIG_PID_NS CONFIG_USER_NS CONFIG_LOCALVERSION; do
+            grep "^${cfg}=" $OUT_DIR/.config || echo "${cfg}=NOT SET"
+          done
+
+          set +e
+          make -k -j$(nproc --all) "${MAKE_ARGS[@]}" 2>&1 | tee build.log
+          BUILD_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          BUILD_OK=0
+          if [ -f "$OUT_DIR/arch/arm64/boot/Image.gz-dtb" ]; then
+            ls -la "$OUT_DIR/arch/arm64/boot/Image.gz-dtb"
+            BUILD_OK=1
+          elif [ -f "$OUT_DIR/arch/arm64/boot/Image" ]; then
+            ls -la "$OUT_DIR/arch/arm64/boot/Image"
+            BUILD_OK=1
+          fi
+          echo "BUILD_OK=$BUILD_OK" >> "$GITHUB_ENV"
+          [ "$BUILD_OK" -eq 1 ] || exit 1
