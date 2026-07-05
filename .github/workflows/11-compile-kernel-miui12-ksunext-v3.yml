@@ -1,4 +1,4 @@
-name: 11. Compile Kernel MIUI 12 Stock - Poco F1 + KernelSU-Next + SUSFS (v2 fixed)
+name: 11. Compile Kernel MIUI 12 Stock - Poco F1 + KernelSU-Next + SUSFS (v3 Proton Clang)
 
 on:
   workflow_dispatch:
@@ -6,13 +6,13 @@ on:
       zip_name:
         description: 'Nama Build'
         required: true
-        default: 'miui12-beryllium-ksunext-susfs-v2'
+        default: 'miui12-beryllium-ksunext-susfs-v3'
       kernel_source:
-        description: 'Kernel Source (MiCode Xiaomi Open Source)'
+        description: 'Kernel Source'
         required: true
         default: 'https://github.com/MiCode/Xiaomi_Kernel_OpenSource.git'
       kernel_branch:
-        description: 'Kernel Branch (MIUI 12 = dipper-q-oss)'
+        description: 'Kernel Branch'
         required: true
         default: 'dipper-q-oss'
       defconfig:
@@ -20,7 +20,7 @@ on:
         required: true
         default: 'beryllium_user_defconfig'
       ksu_tag:
-        description: 'KernelSU-Next tag/commit'
+        description: 'KernelSU-Next tag'
         required: false
         default: 'v3.2.0'
       ksu_setup_url:
@@ -43,10 +43,6 @@ on:
         description: 'SUSFS patch URL'
         required: true
         default: 'https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/Patch/susfs_patch_to_4.9.patch'
-      clang_url:
-        description: 'Clang prebuilt (r383902 untuk MIUI 12 compatibility)'
-        required: false
-        default: 'https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android11-release/clang-r383902.tar.gz'
 
 env:
   KBUILD_BUILD_USER: "Nerf."
@@ -66,45 +62,69 @@ jobs:
       - name: 2. Show inputs
         run: |
           echo "========================================"
-          echo "  MIUI 12 STOCK + KSU-NEXT + SUSFS"
-          echo "  (v2 - fixed for old kernel + modern Clang)"
-          echo "========================================"
-          echo "Kernel source : ${{ github.event.inputs.kernel_source }}"
-          echo "Kernel branch : ${{ github.event.inputs.kernel_branch }}"
-          echo "Defconfig     : ${{ github.event.inputs.defconfig }}"
-          echo "KSU-Next tag  : ${{ github.event.inputs.ksu_tag }}"
-          echo "Enable SUSFS  : ${{ github.event.inputs.enable_susfs }}"
+          echo "  MIUI 12 STOCK + KSU-NEXT + SUSFS v3"
+          echo "  (Proton Clang untuk kompatibilitas)"
           echo "========================================"
 
       - name: 3. Install deps
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            bc build-essential flex bison ca-certificates clang lld llvm \
-            libssl-dev libelf-dev cpio curl git unzip wget python3 python-is-python3 \
+            bc build-essential flex bison ca-certificates \
+            libssl-dev libelf-dev cpio curl git unzip wget zip \
+            python3 python-is-python3 \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
             g++-aarch64-linux-gnu g++-arm-linux-gnueabi \
             binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
             libncurses5-dev libncursesw5-dev patch jq
 
-      - name: 4. Setup Clang cache
+      # ============================================================
+      # STEP 4: Setup Proton Clang (RELIABLE untuk kernel Android)
+      # ============================================================
+      - name: 4. Setup Proton Clang cache
         id: clang-cache
         uses: actions/cache@v4
         with:
-          path: ~/clang-ext
-          key: clang-${{ github.event.inputs.clang_url }}
+          path: ~/proton-clang
+          key: proton-clang-20210522
 
-      - name: 5. Download Clang
+      - name: 5. Download Proton Clang
         if: steps.clang-cache.outputs.cache-hit != 'true'
         run: |
-          mkdir -p ~/clang-ext
-          curl -Lo clang.tar.gz "${{ github.event.inputs.clang_url }}"
-          tar -xzf clang.tar.gz -C ~/clang-ext
-          rm -f clang.tar.gz
-          ~/clang-ext/bin/clang --version
+          echo "== Downloading Proton Clang =="
+          mkdir -p ~/proton-clang
+
+          # Try multiple sources untuk reliability
+          PROTON_URL="https://github.com/kdrag0n/proton-clang/archive/refs/heads/master.tar.gz"
+          
+          echo "Downloading dari: $PROTON_URL"
+          curl -L --fail -o /tmp/proton-clang.tar.gz "$PROTON_URL"
+          
+          echo "== File size check =="
+          ls -lh /tmp/proton-clang.tar.gz
+          FILE_SIZE=$(stat -c%s /tmp/proton-clang.tar.gz)
+          
+          if [ "$FILE_SIZE" -lt 100000000 ]; then
+            echo "[WARN] File terlalu kecil ($FILE_SIZE bytes), coba alternate source..."
+            # Alternate: clone Proton Clang repo langsung
+            rm -f /tmp/proton-clang.tar.gz
+            git clone --depth=1 https://github.com/kdrag0n/proton-clang.git ~/proton-clang-git
+            mv ~/proton-clang-git/* ~/proton-clang/
+            rm -rf ~/proton-clang-git
+          else
+            echo "== Extract =="
+            tar -xzf /tmp/proton-clang.tar.gz -C ~/proton-clang --strip-components=1
+            rm -f /tmp/proton-clang.tar.gz
+          fi
+          
+          echo "== Verifikasi Clang =="
+          ls -la ~/proton-clang/bin/ | head -10
+          ~/proton-clang/bin/clang --version
 
       - name: 6. Add Clang to PATH
-        run: echo "$HOME/clang-ext/bin" >> $GITHUB_PATH
+        run: |
+          echo "$HOME/proton-clang/bin" >> $GITHUB_PATH
+          echo "$HOME/proton-clang/lib" >> $GITHUB_PATH
 
       - name: 7. Clone MIUI 12 kernel source
         run: |
@@ -114,29 +134,18 @@ jobs:
             kernel-src
 
           cd kernel-src
-          echo "== Verifikasi branch =="
           git log -1 --oneline
-          echo ""
-          echo "== Defconfig untuk beryllium =="
           find arch/arm64/configs -iname "*beryllium*"
 
-      # ============================================================
-      # STEP 8: Setup KernelSU-Next (SIMPLE)
-      # ============================================================
       - name: 8. Setup KernelSU-Next
         run: |
           cd kernel-src
-
           curl -LSs "${{ github.event.inputs.ksu_setup_url }}" | bash -s "${{ github.event.inputs.ksu_tag }}"
 
-          echo "== Verifikasi KSU-Next integration =="
-          ls -la drivers/kernelsu || echo "TIDAK ADA symlink!"
-          grep -n "kernelsu" drivers/Makefile || echo "TIDAK ADA di Makefile!"
-          grep -n "kernelsu" drivers/Kconfig || echo "TIDAK ADA di Kconfig!"
+          echo "== Verifikasi =="
+          ls -la drivers/kernelsu || echo "MISSING!"
+          grep -n "kernelsu" drivers/Makefile || echo "MISSING in Makefile!"
 
-      # ============================================================
-      # STEP 9: SUSFS integration (opsional)
-      # ============================================================
       - name: 9. Clone SUSFS & apply patch
         if: github.event.inputs.enable_susfs == 'true'
         run: |
@@ -162,15 +171,11 @@ jobs:
             cp .susfs4ksu/kernel_patches/fs/sus_su.c fs/sus_su.c
           fi
 
-      # ============================================================
-      # STEP 10: Manual fix SUSFS hunks (kernel MIUI mungkin beda)
-      # ============================================================
       - name: 10. Manual fix SUSFS hunks
         if: github.event.inputs.enable_susfs == 'true'
         run: |
           cd kernel-src
 
-          # Fix 1: proc_namespace includes
           if [ -f fs/proc_namespace.c ] && ! grep -q "susfs_def.h" fs/proc_namespace.c; then
             sed -i '/#include "proc\/internal.h"/a\
           #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\
@@ -178,7 +183,6 @@ jobs:
           #endif' fs/proc_namespace.c
           fi
 
-          # Fix 2: wrap getattr di stat.c
           if [ -f fs/stat.c ] && ! grep -q "int err = inode->i_op->getattr" fs/stat.c; then
             python3 << 'PYEOF'
           import re
@@ -204,7 +208,6 @@ jobs:
           PYEOF
           fi
 
-          # Fix 3: Force include susfs.h
           python3 << 'PYEOF'
           from pathlib import Path
           for filepath in ["fs/open.c", "fs/stat.c", "fs/proc_namespace.c", "fs/proc/task_mmu.c", "fs/proc/cmdline.c"]:
@@ -226,7 +229,6 @@ jobs:
               p.write_text('\n'.join(lines))
           PYEOF
 
-          # Fix 4: extern declarations
           if [ -f fs/proc_namespace.c ] && ! grep -q "extern bool susfs_is_current_ksu_domain" fs/proc_namespace.c; then
             python3 << 'PYEOF'
           from pathlib import Path
@@ -246,7 +248,6 @@ jobs:
           PYEOF
           fi
 
-          # Fix 5: forward decl di stat.c
           if [ -f fs/stat.c ] && ! grep -q "extern void susfs_sus_kstat_spoof_generic_fillattr" fs/stat.c; then
             python3 << 'PYEOF'
           from pathlib import Path
@@ -263,7 +264,6 @@ jobs:
           PYEOF
           fi
 
-          # Fix 6: hapus stray call di stat.c
           if [ -f fs/stat.c ] && grep -q "^EXPORT_SYMBOL(vfs_getattr_nosec);$" fs/stat.c; then
             python3 << 'PYEOF'
           from pathlib import Path
@@ -286,72 +286,32 @@ jobs:
           fi
 
       # ============================================================
-      # STEP 11: FIX untuk MIUI 12 kernel compatibility issues
+      # STEP 11: Fix MIUI kernel compatibility
       # ============================================================
-      # Bypass:
-      # - CC_STACKPROTECTOR_STRONG check yang gagal dengan Clang modern
-      # - Compiler check yang bermasalah
-      # ============================================================
-      - name: 11. Fix MIUI kernel compatibility issues
+      - name: 11. Fix MIUI kernel compat issues
         run: |
           cd kernel-src
 
-          echo "== Fix 1: Disable stack protector strong check =="
-          # MIUI kernel scripts check ada bug dengan Clang modern
-          # Ganti ke NONE atau REGULAR yang tidak butuh test flag
+          echo "== Fix 1: -fcommon HOSTCFLAGS untuk dtc =="
+          DTC_MAKEFILE="scripts/dtc/Makefile"
+          if [ -f "$DTC_MAKEFILE" ] && ! grep -q "fcommon" "$DTC_MAKEFILE"; then
+            sed -i '1i HOSTCFLAGS_dtc.o += -fcommon\nHOSTCFLAGS_dtc-lexer.lex.o += -fcommon\nHOSTCFLAGS_dtc-parser.tab.o += -fcommon\n' "$DTC_MAKEFILE"
+            echo "[OK] Added -fcommon"
+          fi
+
+          echo ""
+          echo "== Fix 2: Bypass compiler check =="
           MAKEFILE="Makefile"
-          
-          # Bypass compiler check di Makefile utama
           if grep -q "prepare-compiler-check" "$MAKEFILE"; then
-            echo "  Bypassing prepare-compiler-check..."
+            # Ganti dependency
             sed -i 's|prepare-compiler-check|prepare-compiler-check-skip|' "$MAKEFILE"
-            # Buat target dummy
             echo "" >> "$MAKEFILE"
             echo "prepare-compiler-check-skip:" >> "$MAKEFILE"
-            echo -e "\t@echo 'Skipping compiler check (bypassed for modern Clang)'" >> "$MAKEFILE"
-            echo "[OK] Compiler check bypassed"
+            printf "\t@echo 'Skipping compiler check'\n" >> "$MAKEFILE"
+            echo "[OK] Bypassed compiler check"
           fi
 
-          echo ""
-          echo "== Fix 2: dtc yylloc duplicate symbol (add -fcommon) =="
-          # Modern GCC/Clang lebih strict tentang common symbols
-          # Add -fcommon flag ke HOSTCFLAGS untuk dtc
-          DTC_MAKEFILE="scripts/dtc/Makefile"
-          if [ -f "$DTC_MAKEFILE" ]; then
-            if ! grep -q "fcommon" "$DTC_MAKEFILE"; then
-              # Add HOSTCFLAGS dengan -fcommon
-              sed -i '1i HOSTCFLAGS_dtc.o += -fcommon\nHOSTCFLAGS_dtc-lexer.lex.o += -fcommon\nHOSTCFLAGS_dtc-parser.tab.o += -fcommon\n' "$DTC_MAKEFILE"
-              echo "[OK] Added -fcommon to dtc HOSTCFLAGS"
-            fi
-          fi
-
-          echo ""
-          echo "== Fix 3: Suppress -Wno-undefined-optimized warning =="
-          # Clang modern tidak kenal flag ini, tapi cuma warning
-          # Skip - warning tidak fatal
-
-          echo ""
-          echo "== Fix 4: VDSO32 assembler fix =="
-          # /usr/bin/as tidak support -EL, harus pakai arm-linux-gnueabi-as
-          VDSO_MAKEFILE="arch/arm64/kernel/vdso32/Makefile"
-          if [ -f "$VDSO_MAKEFILE" ]; then
-            # Force pakai cross assembler
-            if ! grep -q "arm-linux-gnueabi-as" "$VDSO_MAKEFILE"; then
-              # Method 1: prepend cross-toolchain path
-              echo "AS := arm-linux-gnueabi-as" > /tmp/vdso_prefix
-              cat "$VDSO_MAKEFILE" >> /tmp/vdso_prefix
-              cp /tmp/vdso_prefix "$VDSO_MAKEFILE"
-              echo "[OK] Forced VDSO32 to use arm-linux-gnueabi-as"
-            fi
-          fi
-
-          # Alternatif: skip VDSO32 kalau tetap bermasalah
-          # Kernel tetap bisa boot tanpa vdso32 (cuma miss 32-bit compat)
-
-      # ============================================================
-      # STEP 12: Prepare defconfig
-      # ============================================================
-      - name: 12. Prepare defconfig (MIUI + KSU + namespace fix)
+      - name: 12. Prepare defconfig
         run: |
           cd kernel-src
           DEFCONFIG_PATH="arch/arm64/configs/${{ github.event.inputs.defconfig }}"
@@ -365,27 +325,26 @@ jobs:
           # Bersihkan entry lama
           sed -i '/^CONFIG_KSU/d;/^# CONFIG_KSU is not set/d;/SUSFS/d' "$DEFCONFIG_PATH"
 
-          # DISABLE stack protector strong (bermasalah dengan Clang modern check)
+          # DISABLE stack protector strong (Clang modern check bermasalah)
           sed -i '/^CONFIG_CC_STACKPROTECTOR_STRONG=y/d' "$DEFCONFIG_PATH"
 
-          # ENABLE UTS_NS dan PID_NS (MIUI stock disable, KSU butuh)
+          # ENABLE UTS_NS dan PID_NS (WAJIB untuk KSU)
           sed -i 's|^# CONFIG_UTS_NS is not set|CONFIG_UTS_NS=y|' "$DEFCONFIG_PATH"
           sed -i 's|^# CONFIG_PID_NS is not set|CONFIG_PID_NS=y|' "$DEFCONFIG_PATH"
 
-          # Append config
           {
             echo ""
-            echo "# === Stack Protector fix untuk Clang modern ==="
+            echo "# Stack protector (Clang modern fix)"
             echo "# CONFIG_CC_STACKPROTECTOR_STRONG is not set"
             echo "CONFIG_CC_STACKPROTECTOR_REGULAR=y"
             echo ""
-            echo "# === KernelSU-Next (kprobe hooks) ==="
+            echo "# KernelSU-Next (kprobe hooks)"
             echo "CONFIG_KSU=y"
             echo "CONFIG_KPROBES=y"
             echo "CONFIG_KPROBE_EVENTS=y"
             echo "CONFIG_KSU_KPROBE_HOOKS=y"
             echo ""
-            echo "# === Namespace (WAJIB untuk KSU) ==="
+            echo "# Namespace (WAJIB)"
             echo "CONFIG_UTS_NS=y"
             echo "CONFIG_PID_NS=y"
           } >> "$DEFCONFIG_PATH"
@@ -393,7 +352,7 @@ jobs:
           if [ "${{ github.event.inputs.enable_susfs }}" = "true" ]; then
             {
               echo ""
-              echo "# === SUSFS ==="
+              echo "# SUSFS"
               echo "CONFIG_KSU_SUSFS=y"
               echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
               echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
@@ -410,27 +369,22 @@ jobs:
 
           {
             echo ""
-            echo "# === Filesystem ==="
+            echo "# Filesystem"
             echo "CONFIG_TMPFS_XATTR=y"
             echo ""
-            echo "# === Custom branding ==="
+            echo "# Custom branding"
             echo 'CONFIG_LOCALVERSION="-Nerf"'
           } >> "$DEFCONFIG_PATH"
 
-          echo "== Config check =="
+          echo "== Config final =="
           grep -E "CONFIG_KSU|SUSFS|UTS_NS|PID_NS|STACKPROTECTOR|LOCALVERSION" "$DEFCONFIG_PATH" | sort
 
-      - name: 13. Patch arch/arm64/Makefile untuk clang vdso32
+      - name: 13. Patch arch/arm64/Makefile
         run: |
           cd kernel-src
           MAIN_MK="arch/arm64/Makefile"
           [ -f "$MAIN_MK" ] || exit 1
-          
-          # Fix CLANG_PREFIX32 kalau ada pattern-nya
           sed -i -E 's@(CLANG_PREFIX32[[:space:]]*:=[[:space:]]*--prefix=\$\(GCC_TOOLCHAIN32_DIR\))[[:space:]]*$@\1$(notdir $(CROSS_COMPILE_ARM32))@' "$MAIN_MK" 2>/dev/null || true
-          
-          echo "== Current CLANG_PREFIX32 =="
-          grep -n "CLANG_PREFIX32" "$MAIN_MK" || echo "(tidak ada pattern CLANG_PREFIX32)"
 
       - name: 14. Skip broken DTBs
         run: |
@@ -441,13 +395,13 @@ jobs:
             sed -i "/$dtb/d" "$DTS_MK" 2>/dev/null || true
           done
 
-      - name: 15. Compile Kernel
+      - name: 15. Compile Kernel dengan Proton Clang
         run: |
           cd kernel-src
           OUT_DIR="out"
-          export PATH="$HOME/clang-ext/bin:$PATH"
+          export PATH="$HOME/proton-clang/bin:$PATH"
+          export LD_LIBRARY_PATH="$HOME/proton-clang/lib:$LD_LIBRARY_PATH"
 
-          # Verify Clang version
           echo "== Clang version =="
           clang --version
 
@@ -474,7 +428,7 @@ jobs:
           make "${MAKE_ARGS[@]}" ${{ github.event.inputs.defconfig }}
           make "${MAKE_ARGS[@]}" olddefconfig
 
-          echo "== Config final check =="
+          echo "== Config check =="
           for cfg in CONFIG_KSU CONFIG_KSU_KPROBE_HOOKS CONFIG_UTS_NS CONFIG_PID_NS; do
             grep "^${cfg}=" $OUT_DIR/.config || echo "${cfg}=NOT SET"
           done
@@ -511,6 +465,9 @@ jobs:
               "version": "$(cat out/include/config/kernel.release)",
               "defconfig": "${{ github.event.inputs.defconfig }}"
             },
+            "toolchain": {
+              "clang": "Proton Clang (community build)"
+            },
             "kernelsu_next": {
               "tag": "${{ github.event.inputs.ksu_tag }}",
               "commit": "${KSU_COMMIT}",
@@ -518,7 +475,6 @@ jobs:
             },
             "susfs": {
               "enabled": "${{ github.event.inputs.enable_susfs }}",
-              "branch": "${{ github.event.inputs.susfs_branch }}",
               "commit": "${SUSFS_COMMIT}"
             }
           }
@@ -529,7 +485,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log-miui12-ksunext-v2
+          name: build-log-miui12-ksunext-v3
           path: kernel-src/build.log
           retention-days: 7
 
@@ -545,6 +501,6 @@ jobs:
         if: env.BUILD_OK == '1'
         uses: actions/upload-artifact@v4
         with:
-          name: build-metadata-miui12-ksunext-v2
+          name: build-metadata-miui12-ksunext-v3
           path: build-metadata.json
           retention-days: 30
