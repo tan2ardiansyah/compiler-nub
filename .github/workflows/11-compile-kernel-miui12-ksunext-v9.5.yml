@@ -1,4 +1,4 @@
-name: 11. Compile Kernel MIUI 12 v9.4 - Fix PATH resolution
+name: 11. Compile Kernel MIUI 12 v9.5 - LD wrapper fix
 
 on:
   workflow_dispatch:
@@ -78,13 +78,17 @@ jobs:
             binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
             libncurses5-dev libncursesw5-dev python3 python-is-python3 patch jq
 
-      - name: Install AS wrapper (fix -EL error)
+      # ============================================================
+      # AS WRAPPER: fix -EL assembler error
+      # ============================================================
+      - name: Install AS wrapper (fix -EL assembler error)
         run: |
           echo "== Backup /usr/bin/as =="
           sudo cp /usr/bin/as /usr/bin/as.orig
           
           sudo tee /usr/bin/as-wrapper > /dev/null << 'WRAPPER'
           #!/bin/bash
+          # Wrapper: detect ARM flag → delegate ke cross-assembler
           for arg in "$@"; do
             case "$arg" in
               -EL|-EB|-mabi=lp64|-mgeneral-regs-only|-mfpu=*|-march=armv*|-mcpu=cortex-*)
@@ -100,12 +104,64 @@ jobs:
           
           ls -la /usr/bin/as /usr/bin/as.orig /usr/bin/as-wrapper
 
+      # ============================================================
+      # LD WRAPPER: fix aarch64linux emulation error (VDSO linking)
+      # ============================================================
+      # Kernel VDSO linker panggil `ld` dengan emulation aarch64linux
+      # /usr/bin/ld native x86_64 tidak support aarch64
+      # Wrapper: detect emulation ARM → delegate ke cross-linker
+      # ============================================================
+      - name: Install LD wrapper (fix aarch64linux emulation)
+        run: |
+          echo "== Backup /usr/bin/ld =="
+          sudo cp /usr/bin/ld /usr/bin/ld.orig
+          
+          sudo tee /usr/bin/ld-wrapper > /dev/null << 'WRAPPER'
+          #!/bin/bash
+          # Wrapper: detect ARM linker emulation → delegate ke cross-linker
+          # 
+          # Trigger flags:
+          #   -m aarch64linux   → emulation ARM64 little-endian
+          #   -m aarch64linuxb  → emulation ARM64 big-endian
+          #   aarch64linux      → alone (some kernel Makefiles pass this way)
+          #   -EL, -EB          → endianness flags
+          
+          # Check if any argument is ARM64 emulation related
+          PREV=""
+          for arg in "$@"; do
+            case "$arg" in
+              aarch64linux|aarch64linuxb|armelf*)
+                exec /usr/bin/aarch64-linux-gnu-ld "$@"
+                ;;
+              -EL|-EB)
+                exec /usr/bin/aarch64-linux-gnu-ld "$@"
+                ;;
+            esac
+            # Handle "-m aarch64linux" (with space)
+            if [ "$PREV" = "-m" ]; then
+              case "$arg" in
+                aarch64linux*|armelf*)
+                  exec /usr/bin/aarch64-linux-gnu-ld "$@"
+                  ;;
+              esac
+            fi
+            PREV="$arg"
+          done
+          # Default: pakai native x86_64 ld
+          exec /usr/bin/ld.orig "$@"
+          WRAPPER
+          
+          sudo chmod +x /usr/bin/ld-wrapper
+          sudo ln -sf /usr/bin/ld-wrapper /usr/bin/ld
+          
+          ls -la /usr/bin/ld /usr/bin/ld.orig /usr/bin/ld-wrapper
+
       - name: Setup Clang Cache
         id: clang-cache
         uses: actions/cache@v4
         with:
           path: ~/clang-ext
-          key: clang-v9.4-${{ github.event.inputs.clang_url }}
+          key: clang-v9.5-${{ github.event.inputs.clang_url }}
 
       - name: Setup Clang (fallback ke Proton)
         if: steps.clang-cache.outputs.cache-hit != 'true'
@@ -409,10 +465,13 @@ jobs:
           done
 
       # ============================================================
-      # STEP KOMPILE: kunci fix di sini
-      # 1. PATH sistem duluan
-      # 2. Rename binary Proton yang konflik
-      # 3. Absolute path untuk Clang tools
+      # COMPILE: rename Proton binaries yang konflik, pakai wrapper
+      # ============================================================
+      # PENTING:
+      # - Rename `as`, `ld`, `ar`, dll dari Proton (kalau ada) supaya
+      #   sistem tools (dengan wrapper) yang dipakai
+      # - JANGAN rename `ld.lld` (dibutuhkan untuk link kernel ARM64)
+      # - PATH sistem duluan biar wrapper kepanggil
       # ============================================================
       - name: Compile Kernel
         run: |
@@ -422,6 +481,8 @@ jobs:
           export PATH="/usr/bin:/bin:$HOME/clang-ext/bin"
           
           echo "== Rename Proton binaries yang konflik dengan sistem =="
+          # HANYA rename yang konflik (as, ld biasa, ar, dll)
+          # JANGAN rename ld.lld! (dipakai untuk link kernel ARM64)
           for bin in as ld ar nm objcopy objdump strip readelf; do
             if [ -f "$HOME/clang-ext/bin/$bin" ]; then
               mv "$HOME/clang-ext/bin/$bin" "$HOME/clang-ext/bin/$bin.proton" 2>/dev/null && \
@@ -430,7 +491,16 @@ jobs:
           done
           
           echo ""
-          echo "== Verify tools =="
+          echo "== Verify ld.lld STILL AVAILABLE =="
+          if [ ! -f "$HOME/clang-ext/bin/ld.lld" ]; then
+            echo "[FATAL] ld.lld hilang! Kernel ARM64 tidak bisa di-link"
+            ls -la "$HOME/clang-ext/bin/" | head -20
+            exit 1
+          fi
+          ls -la "$HOME/clang-ext/bin/ld.lld"
+          
+          echo ""
+          echo "== Verify wrappers aktif =="
           echo "as → $(readlink -f $(which as))"
           echo "ld → $(readlink -f $(which ld))"
           echo "gcc → $(readlink -f $(which gcc))"
@@ -446,16 +516,12 @@ jobs:
           ld --version | head -1
 
           CLANG_PATH="$HOME/clang-ext/bin"
-          
-          # Cek nama ld.lld (mungkin sudah di-rename)
-          LD_LLD="${CLANG_PATH}/ld.lld"
-          [ ! -f "$LD_LLD" ] && [ -f "${CLANG_PATH}/ld.lld.proton" ] && LD_LLD="${CLANG_PATH}/ld.lld.proton"
 
           MAKE_ARGS=(
             O=$OUT_DIR
             ARCH=arm64
             CC=${CLANG_PATH}/clang
-            LD=${LD_LLD}
+            LD=${CLANG_PATH}/ld.lld
             AR=${CLANG_PATH}/llvm-ar
             NM=${CLANG_PATH}/llvm-nm
             OBJCOPY=${CLANG_PATH}/llvm-objcopy
@@ -499,12 +565,25 @@ jobs:
           echo "BUILD_OK=$BUILD_OK" >> "$GITHUB_ENV"
           [ "$BUILD_OK" -eq 1 ] || exit 1
 
+      # ============================================================
+      # CLEANUP: restore /usr/bin/as dan /usr/bin/ld
+      # ============================================================
       - name: Restore /usr/bin/as
         if: always()
         run: |
           if [ -f /usr/bin/as.orig ]; then
             sudo mv /usr/bin/as.orig /usr/bin/as
             sudo rm -f /usr/bin/as-wrapper
+            echo "[OK] Restored /usr/bin/as"
+          fi
+
+      - name: Restore /usr/bin/ld
+        if: always()
+        run: |
+          if [ -f /usr/bin/ld.orig ]; then
+            sudo mv /usr/bin/ld.orig /usr/bin/ld
+            sudo rm -f /usr/bin/ld-wrapper
+            echo "[OK] Restored /usr/bin/ld"
           fi
 
       - name: Capture metadata
