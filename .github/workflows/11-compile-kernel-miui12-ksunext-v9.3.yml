@@ -1,4 +1,4 @@
-name: 11. Compile Kernel MIUI 12 v9.2 - Fallback Clang + extracted config
+name: 11. Compile Kernel MIUI 12 v9.3 - Ubuntu 22.04 + HOSTLD fix
 
 on:
   workflow_dispatch:
@@ -16,7 +16,7 @@ on:
         required: true
         default: 'dipper-q-oss'
       defconfig:
-        description: 'defconfig path (fallback kalau extracted tidak ada)'
+        description: 'defconfig path'
         required: true
         default: 'beryllium_user_defconfig'
       use_extracted_config:
@@ -40,14 +40,20 @@ on:
         required: true
         default: 'https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/Patch/susfs_patch_to_4.9.patch'
       clang_url:
-        description: 'Clang prebuilt (primary, fallback ke Proton kalau gagal)'
+        description: 'Clang prebuilt (primary, fallback ke Proton)'
         required: false
         default: 'https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-release/clang-r487747c.tar.gz'
 
 jobs:
   test-build:
     name: ${{ github.event.inputs.zip_name }}
-    runs-on: ubuntu-latest
+    # ============================================================
+    # PENTING: Pin ke Ubuntu 22.04
+    # Alasan: kalau fallback ke Proton Clang (Sumber 3),
+    # ld.lld Proton tidak kompat dengan libc Ubuntu 24.04
+    # Ubuntu 22.04 libc lebih tua = kompat
+    # ============================================================
+    runs-on: ubuntu-22.04
     env:
       KBUILD_BUILD_USER: "Nerf."
       KBUILD_BUILD_HOST: "OldlineSSS"
@@ -63,6 +69,9 @@ jobs:
           echo "use_extracted_config: ${{ github.event.inputs.use_extracted_config }}"
           echo "ksu_tag: ${{ github.event.inputs.ksu_tag }}"
           echo "enable_susfs: ${{ github.event.inputs.enable_susfs }}"
+          echo ""
+          echo "== Runner OS =="
+          cat /etc/os-release | head -3
 
       - name: Install Build Dependencies
         run: |
@@ -75,9 +84,6 @@ jobs:
             binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
             libncurses5-dev libncursesw5-dev python3 python-is-python3 patch jq
 
-      # ============================================================
-      # AS wrapper: fix -EL assembler error
-      # ============================================================
       - name: Install AS wrapper (fix -EL error)
         run: |
           echo "== Backup /usr/bin/as =="
@@ -86,7 +92,6 @@ jobs:
           echo "== Create wrapper =="
           sudo tee /usr/bin/as-wrapper > /dev/null << 'WRAPPER'
           #!/bin/bash
-          # Wrapper: detect ARM flag, delegate ke cross-assembler
           for arg in "$@"; do
             case "$arg" in
               -EL|-EB|-mabi=lp64|-mgeneral-regs-only|-mfpu=*|-march=armv*|-mcpu=cortex-*)
@@ -94,7 +99,6 @@ jobs:
                 ;;
             esac
           done
-          # Default: pakai native x86_64 (untuk host tools)
           exec /usr/bin/as.orig "$@"
           WRAPPER
           
@@ -104,15 +108,12 @@ jobs:
           echo "== Verify =="
           ls -la /usr/bin/as /usr/bin/as.orig /usr/bin/as-wrapper
 
-      # ============================================================
-      # Clang setup dengan FALLBACK ke beberapa sumber
-      # ============================================================
       - name: Setup Clang Cache
         id: clang-cache
         uses: actions/cache@v4
         with:
           path: ~/clang-ext
-          key: clang-v9.2-${{ github.event.inputs.clang_url }}
+          key: clang-v9.3-${{ github.event.inputs.clang_url }}
 
       - name: Setup Clang (fallback ke Proton kalau AOSP gagal)
         if: steps.clang-cache.outputs.cache-hit != 'true'
@@ -121,7 +122,6 @@ jobs:
           CLANG_OK=0
           CLANG_SOURCE=""
           
-          # ============ Sumber 1: URL dari input (AOSP r487747c default) ============
           echo "════════════════════════════════════════════"
           echo "== [1/3] Coba URL primary (AOSP dari input)"
           echo "════════════════════════════════════════════"
@@ -132,31 +132,25 @@ jobs:
             FILE_SIZE=$(stat -c%s /tmp/clang.tar.gz)
             echo "Downloaded: $FILE_SIZE bytes"
             if [ "$FILE_SIZE" -gt 10000000 ]; then
-              echo "[OK] File size cukup, extract..."
               if tar -xzf /tmp/clang.tar.gz -C ~/clang-ext 2>&1; then
                 CLANG_OK=1
                 CLANG_SOURCE="AOSP r487747c (primary)"
                 echo "[SUCCESS] Sumber 1 berhasil"
               else
-                echo "[FAIL] Extract gagal"
                 rm -rf ~/clang-ext/*
               fi
             else
-              echo "[FAIL] File terlalu kecil ($FILE_SIZE bytes), kemungkinan HTML error page"
+              echo "[FAIL] File terlalu kecil ($FILE_SIZE bytes)"
             fi
-          else
-            echo "[FAIL] Download gagal (curl error)"
           fi
           rm -f /tmp/clang.tar.gz
           
-          # ============ Sumber 2: AOSP main branch (mirror alternate) ============
           if [ "$CLANG_OK" -ne 1 ]; then
             echo ""
             echo "════════════════════════════════════════════"
-            echo "== [2/3] Coba AOSP main branch alternate"
+            echo "== [2/3] Coba AOSP main branch"
             echo "════════════════════════════════════════════"
             ALT_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r487747c.tar.gz"
-            echo "URL: $ALT_URL"
             
             if curl -L --fail --max-time 60 -o /tmp/clang.tar.gz "$ALT_URL" 2>&1; then
               FILE_SIZE=$(stat -c%s /tmp/clang.tar.gz)
@@ -164,28 +158,22 @@ jobs:
               if [ "$FILE_SIZE" -gt 10000000 ]; then
                 if tar -xzf /tmp/clang.tar.gz -C ~/clang-ext 2>&1; then
                   CLANG_OK=1
-                  CLANG_SOURCE="AOSP r487747c (main branch)"
+                  CLANG_SOURCE="AOSP r487747c (main)"
                   echo "[SUCCESS] Sumber 2 berhasil"
                 else
                   rm -rf ~/clang-ext/*
                 fi
-              else
-                echo "[FAIL] File terlalu kecil ($FILE_SIZE bytes)"
               fi
-            else
-              echo "[FAIL] Download gagal"
             fi
             rm -f /tmp/clang.tar.gz
           fi
           
-          # ============ Sumber 3: Proton Clang (community, fallback terakhir) ============
           if [ "$CLANG_OK" -ne 1 ]; then
             echo ""
             echo "════════════════════════════════════════════"
-            echo "== [3/3] Fallback ke Proton Clang (community)"
+            echo "== [3/3] Fallback ke Proton Clang"
             echo "════════════════════════════════════════════"
             PROTON_URL="https://github.com/kdrag0n/proton-clang/archive/refs/heads/master.tar.gz"
-            echo "URL: $PROTON_URL"
             
             if curl -L --fail --max-time 180 -o /tmp/clang.tar.gz "$PROTON_URL" 2>&1; then
               FILE_SIZE=$(stat -c%s /tmp/clang.tar.gz)
@@ -193,8 +181,8 @@ jobs:
               if [ "$FILE_SIZE" -gt 10000000 ]; then
                 if tar -xzf /tmp/clang.tar.gz -C ~/clang-ext --strip-components=1 2>&1; then
                   CLANG_OK=1
-                  CLANG_SOURCE="Proton Clang (community fallback)"
-                  echo "[SUCCESS] Sumber 3 (Proton) berhasil"
+                  CLANG_SOURCE="Proton Clang (fallback)"
+                  echo "[SUCCESS] Proton berhasil"
                 else
                   rm -rf ~/clang-ext/*
                 fi
@@ -202,39 +190,24 @@ jobs:
             fi
             rm -f /tmp/clang.tar.gz
             
-            # Sub-fallback: git clone Proton
             if [ "$CLANG_OK" -ne 1 ]; then
-              echo ""
-              echo "== Sub-fallback: git clone Proton Clang =="
+              echo "== Sub-fallback: git clone Proton =="
               rm -rf ~/clang-ext
               if git clone --depth=1 https://github.com/kdrag0n/proton-clang.git ~/clang-ext 2>&1; then
                 CLANG_OK=1
                 CLANG_SOURCE="Proton Clang (git clone)"
-                echo "[SUCCESS] Sub-fallback berhasil"
               fi
             fi
           fi
           
           if [ "$CLANG_OK" -ne 1 ]; then
-            echo ""
-            echo "════════════════════════════════════════════"
-            echo "[FATAL] Semua sumber Clang gagal!"
-            echo "════════════════════════════════════════════"
-            echo "Kemungkinan penyebab:"
-            echo "  1. Google/GitHub rate limit (coba lagi nanti)"
-            echo "  2. Network issue di runner"
-            echo "  3. URL Clang berubah"
-            echo ""
-            echo "Solusi:"
-            echo "  - Tunggu 1-2 jam, run ulang"
-            echo "  - Ganti clang_url ke URL yang confirmed working"
+            echo "[FATAL] Semua sumber Clang gagal"
             exit 1
           fi
           
           echo ""
           echo "════════════════════════════════════════════"
-          echo "[OK] Clang berhasil di-setup"
-          echo "     Source: $CLANG_SOURCE"
+          echo "[OK] Clang setup: $CLANG_SOURCE"
           echo "════════════════════════════════════════════"
           ls -la ~/clang-ext/bin/ | head -10
           ~/clang-ext/bin/clang --version | head -3
@@ -400,10 +373,6 @@ jobs:
             fi
           fi
 
-      # ============================================================
-      # PREPARE DEFCONFIG: extracted MIUI + KSU/SUSFS + namespace fix
-      # LOCALVERSION dibiarkan default (-perf, dari MIUI stock)
-      # ============================================================
       - name: Prepare defconfig
         run: |
           cd kernel-src
@@ -415,7 +384,6 @@ jobs:
             exit 1
           fi
 
-          # ============ EXTRACTED CONFIG DARI MIUI BOOT.IMG ============
           if [ "${{ github.event.inputs.use_extracted_config }}" = "true" ]; then
             EXTRACTED_CFG="$GITHUB_WORKSPACE/extracted-config/miui_defconfig.txt"
             if [ -f "$EXTRACTED_CFG" ]; then
@@ -428,21 +396,17 @@ jobs:
             fi
           fi
 
-          # ============ FORCE ENABLE NAMESPACE (WAJIB untuk KSU) ============
           echo "[INFO] Force enable UTS_NS + USER_NS + PID_NS"
           sed -i 's|^# CONFIG_UTS_NS is not set|CONFIG_UTS_NS=y|' "$DEFCONFIG_PATH"
           sed -i 's|^# CONFIG_USER_NS is not set|CONFIG_USER_NS=y|' "$DEFCONFIG_PATH"
           sed -i 's|^# CONFIG_PID_NS is not set|CONFIG_PID_NS=y|' "$DEFCONFIG_PATH"
 
-          # ============ FIX STACK PROTECTOR (Clang modern compat) ============
           echo "[INFO] Ganti stack protector STRONG → REGULAR"
           sed -i '/^CONFIG_CC_STACKPROTECTOR_STRONG=y/d' "$DEFCONFIG_PATH"
           sed -i 's|^# CONFIG_CC_STACKPROTECTOR_REGULAR is not set|CONFIG_CC_STACKPROTECTOR_REGULAR=y|' "$DEFCONFIG_PATH"
 
-          # ============ BERSIHKAN KSU/SUSFS OLD ENTRIES ============
           sed -i '/^CONFIG_KSU/d;/^# CONFIG_KSU is not set/d;/SUSFS/d' "$DEFCONFIG_PATH"
 
-          # ============ APPEND KSU + SUSFS + FIX ============
           {
             echo ""
             echo "# === Namespace force enable (KSU requirement) ==="
@@ -479,10 +443,6 @@ jobs:
             } >> "$DEFCONFIG_PATH"
           fi
 
-          # ============ LOCALVERSION dibiarkan default (-perf dari MIUI) ============
-          echo ""
-          echo "[INFO] LOCALVERSION dibiarkan default dari MIUI stock (-perf)"
-
           echo ""
           echo "== Final config check =="
           grep -E "CONFIG_KSU|SUSFS|UTS_NS|USER_NS|PID_NS|STACKPROTECTOR|LOCALVERSION" "$DEFCONFIG_PATH" | sort
@@ -503,6 +463,13 @@ jobs:
             sed -i "/$dtb/d" "$DTS_MK" 2>/dev/null || true
           done
 
+      # ============================================================
+      # COMPILE: dengan HOSTCC/HOSTLD override untuk safety
+      # ============================================================
+      # Kalau Clang fallback ke Proton, HOSTCC/HOSTLD dari Proton
+      # tidak kompat dengan libc modern.
+      # Override paksa pakai gcc + ld sistem native (aman di 22.04).
+      # ============================================================
       - name: Compile Kernel
         run: |
           cd kernel-src
@@ -515,6 +482,11 @@ jobs:
           echo ""
           echo "== Clang version =="
           clang --version
+
+          echo ""
+          echo "== Host toolchain =="
+          which gcc && gcc --version | head -1
+          which ld && ld --version | head -1
 
           MAKE_ARGS=(
             O=$OUT_DIR
@@ -532,6 +504,10 @@ jobs:
             CROSS_COMPILE_ARM32=arm-linux-gnueabi-
             LLVM=1
             LLVM_IAS=1
+            HOSTCC=/usr/bin/gcc
+            HOSTCXX=/usr/bin/g++
+            HOSTLD=/usr/bin/ld
+            HOSTAR=/usr/bin/ar
           )
 
           mkdir -p $OUT_DIR
@@ -579,7 +555,7 @@ jobs:
           {
             "build_date": "$(date -u '+%Y-%m-%d %H:%M UTC')",
             "target_rom": "MIUI 12 Stock",
-            "config_source": "extracted from MIUI boot.img",
+            "runner": "ubuntu-22.04",
             "kernel": {
               "source": "${{ github.event.inputs.kernel_source }}",
               "branch": "${{ github.event.inputs.kernel_branch }}",
