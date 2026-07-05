@@ -46,7 +46,7 @@ on:
 
 env:
   KBUILD_BUILD_USER: "Nerf."
-  KBUILD_BUILD_HOST: "beryllium"
+  KBUILD_BUILD_HOST: "OldlineSSS"
   ARCH: arm64
 
 jobs:
