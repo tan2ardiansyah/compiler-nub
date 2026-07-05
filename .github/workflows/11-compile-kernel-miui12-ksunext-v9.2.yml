@@ -1,4 +1,4 @@
-name: 11. Compile Kernel MIUI 12 v9.1 - Extracted config + AS wrapper
+name: 11. Compile Kernel MIUI 12 v9.2 - Fallback Clang + extracted config
 
 on:
   workflow_dispatch:
@@ -40,7 +40,7 @@ on:
         required: true
         default: 'https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/Patch/susfs_patch_to_4.9.patch'
       clang_url:
-        description: 'Clang prebuilt (SAMA dengan BaikalOS yang berhasil)'
+        description: 'Clang prebuilt (primary, fallback ke Proton kalau gagal)'
         required: false
         default: 'https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-release/clang-r487747c.tar.gz'
 
@@ -76,11 +76,7 @@ jobs:
             libncurses5-dev libncursesw5-dev python3 python-is-python3 patch jq
 
       # ============================================================
-      # KUNCI FIX: Install AS wrapper untuk redirect ke cross-as
-      # ============================================================
-      # Kernel MIUI Makefile hardcode call `as -EL` (ARM flag)
-      # /usr/bin/as native x86_64 tidak kenal -EL
-      # Wrapper: detect flag ARM → delegate ke /usr/bin/aarch64-linux-gnu-as
+      # AS wrapper: fix -EL assembler error
       # ============================================================
       - name: Install AS wrapper (fix -EL error)
         run: |
@@ -108,20 +104,140 @@ jobs:
           echo "== Verify =="
           ls -la /usr/bin/as /usr/bin/as.orig /usr/bin/as-wrapper
 
+      # ============================================================
+      # Clang setup dengan FALLBACK ke beberapa sumber
+      # ============================================================
       - name: Setup Clang Cache
         id: clang-cache
         uses: actions/cache@v4
         with:
           path: ~/clang-ext
-          key: clang-${{ github.event.inputs.clang_url }}
+          key: clang-v9.2-${{ github.event.inputs.clang_url }}
 
-      - name: Setup Clang
+      - name: Setup Clang (fallback ke Proton kalau AOSP gagal)
         if: steps.clang-cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p ~/clang-ext
-          curl -Lo clang.tar.gz "${{ github.event.inputs.clang_url }}"
-          tar -xzf clang.tar.gz -C ~/clang-ext
-          rm -f clang.tar.gz
+          CLANG_OK=0
+          CLANG_SOURCE=""
+          
+          # ============ Sumber 1: URL dari input (AOSP r487747c default) ============
+          echo "════════════════════════════════════════════"
+          echo "== [1/3] Coba URL primary (AOSP dari input)"
+          echo "════════════════════════════════════════════"
+          PRIMARY_URL="${{ github.event.inputs.clang_url }}"
+          echo "URL: $PRIMARY_URL"
+          
+          if curl -L --fail --max-time 60 -o /tmp/clang.tar.gz "$PRIMARY_URL" 2>&1; then
+            FILE_SIZE=$(stat -c%s /tmp/clang.tar.gz)
+            echo "Downloaded: $FILE_SIZE bytes"
+            if [ "$FILE_SIZE" -gt 10000000 ]; then
+              echo "[OK] File size cukup, extract..."
+              if tar -xzf /tmp/clang.tar.gz -C ~/clang-ext 2>&1; then
+                CLANG_OK=1
+                CLANG_SOURCE="AOSP r487747c (primary)"
+                echo "[SUCCESS] Sumber 1 berhasil"
+              else
+                echo "[FAIL] Extract gagal"
+                rm -rf ~/clang-ext/*
+              fi
+            else
+              echo "[FAIL] File terlalu kecil ($FILE_SIZE bytes), kemungkinan HTML error page"
+            fi
+          else
+            echo "[FAIL] Download gagal (curl error)"
+          fi
+          rm -f /tmp/clang.tar.gz
+          
+          # ============ Sumber 2: AOSP main branch (mirror alternate) ============
+          if [ "$CLANG_OK" -ne 1 ]; then
+            echo ""
+            echo "════════════════════════════════════════════"
+            echo "== [2/3] Coba AOSP main branch alternate"
+            echo "════════════════════════════════════════════"
+            ALT_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r487747c.tar.gz"
+            echo "URL: $ALT_URL"
+            
+            if curl -L --fail --max-time 60 -o /tmp/clang.tar.gz "$ALT_URL" 2>&1; then
+              FILE_SIZE=$(stat -c%s /tmp/clang.tar.gz)
+              echo "Downloaded: $FILE_SIZE bytes"
+              if [ "$FILE_SIZE" -gt 10000000 ]; then
+                if tar -xzf /tmp/clang.tar.gz -C ~/clang-ext 2>&1; then
+                  CLANG_OK=1
+                  CLANG_SOURCE="AOSP r487747c (main branch)"
+                  echo "[SUCCESS] Sumber 2 berhasil"
+                else
+                  rm -rf ~/clang-ext/*
+                fi
+              else
+                echo "[FAIL] File terlalu kecil ($FILE_SIZE bytes)"
+              fi
+            else
+              echo "[FAIL] Download gagal"
+            fi
+            rm -f /tmp/clang.tar.gz
+          fi
+          
+          # ============ Sumber 3: Proton Clang (community, fallback terakhir) ============
+          if [ "$CLANG_OK" -ne 1 ]; then
+            echo ""
+            echo "════════════════════════════════════════════"
+            echo "== [3/3] Fallback ke Proton Clang (community)"
+            echo "════════════════════════════════════════════"
+            PROTON_URL="https://github.com/kdrag0n/proton-clang/archive/refs/heads/master.tar.gz"
+            echo "URL: $PROTON_URL"
+            
+            if curl -L --fail --max-time 180 -o /tmp/clang.tar.gz "$PROTON_URL" 2>&1; then
+              FILE_SIZE=$(stat -c%s /tmp/clang.tar.gz)
+              echo "Downloaded: $FILE_SIZE bytes"
+              if [ "$FILE_SIZE" -gt 10000000 ]; then
+                if tar -xzf /tmp/clang.tar.gz -C ~/clang-ext --strip-components=1 2>&1; then
+                  CLANG_OK=1
+                  CLANG_SOURCE="Proton Clang (community fallback)"
+                  echo "[SUCCESS] Sumber 3 (Proton) berhasil"
+                else
+                  rm -rf ~/clang-ext/*
+                fi
+              fi
+            fi
+            rm -f /tmp/clang.tar.gz
+            
+            # Sub-fallback: git clone Proton
+            if [ "$CLANG_OK" -ne 1 ]; then
+              echo ""
+              echo "== Sub-fallback: git clone Proton Clang =="
+              rm -rf ~/clang-ext
+              if git clone --depth=1 https://github.com/kdrag0n/proton-clang.git ~/clang-ext 2>&1; then
+                CLANG_OK=1
+                CLANG_SOURCE="Proton Clang (git clone)"
+                echo "[SUCCESS] Sub-fallback berhasil"
+              fi
+            fi
+          fi
+          
+          if [ "$CLANG_OK" -ne 1 ]; then
+            echo ""
+            echo "════════════════════════════════════════════"
+            echo "[FATAL] Semua sumber Clang gagal!"
+            echo "════════════════════════════════════════════"
+            echo "Kemungkinan penyebab:"
+            echo "  1. Google/GitHub rate limit (coba lagi nanti)"
+            echo "  2. Network issue di runner"
+            echo "  3. URL Clang berubah"
+            echo ""
+            echo "Solusi:"
+            echo "  - Tunggu 1-2 jam, run ulang"
+            echo "  - Ganti clang_url ke URL yang confirmed working"
+            exit 1
+          fi
+          
+          echo ""
+          echo "════════════════════════════════════════════"
+          echo "[OK] Clang berhasil di-setup"
+          echo "     Source: $CLANG_SOURCE"
+          echo "════════════════════════════════════════════"
+          ls -la ~/clang-ext/bin/ | head -10
+          ~/clang-ext/bin/clang --version | head -3
 
       - name: Add Clang to PATH
         run: echo "$HOME/clang-ext/bin" >> $GITHUB_PATH
@@ -301,7 +417,7 @@ jobs:
 
           # ============ EXTRACTED CONFIG DARI MIUI BOOT.IMG ============
           if [ "${{ github.event.inputs.use_extracted_config }}" = "true" ]; then
-            EXTRACTED_CFG="$GITHUB_WORKSPACE/extracted-config/miui_defconfig"
+            EXTRACTED_CFG="$GITHUB_WORKSPACE/extracted-config/miui_defconfig.txt"
             if [ -f "$EXTRACTED_CFG" ]; then
               echo "[INFO] Pakai extracted config: $EXTRACTED_CFG"
               echo "       Total baris: $(wc -l < "$EXTRACTED_CFG")"
@@ -363,9 +479,9 @@ jobs:
             } >> "$DEFCONFIG_PATH"
           fi
 
-          # ============ LOCALVERSION DIBIARKAN DEFAULT (-perf dari MIUI) ============
+          # ============ LOCALVERSION dibiarkan default (-perf dari MIUI) ============
           echo ""
-          echo "[INFO] LOCALVERSION dibiarkan default dari MIUI stock"
+          echo "[INFO] LOCALVERSION dibiarkan default dari MIUI stock (-perf)"
 
           echo ""
           echo "== Final config check =="
