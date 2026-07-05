@@ -1,4 +1,4 @@
-name: 11. Compile Kernel MIUI 12 Stock - Poco F1 + KernelSU-Next + SUSFS (v4 host linker fix)
+name: 11. Compile Kernel MIUI 12 Stock v5 - Ubuntu 22.04 fix
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       zip_name:
         description: 'Nama Build'
         required: true
-        default: 'miui12-beryllium-ksunext-susfs-v4'
+        default: 'miui12-beryllium-ksunext-susfs-v5'
       kernel_source:
         description: 'Kernel Source'
         required: true
@@ -46,25 +46,33 @@ on:
 
 env:
   KBUILD_BUILD_USER: "Nerf."
-  KBUILD_BUILD_HOST: "OldlineSSS"
+  KBUILD_BUILD_HOST: "beryllium"
   ARCH: arm64
 
 jobs:
   build:
     name: ${{ github.event.inputs.zip_name }}
-    runs-on: ubuntu-latest
+    # ============================================================
+    # PENTING: Pin ke Ubuntu 22.04 (bukan latest / 24.04)
+    # Karena Proton Clang ld.lld tidak kompat dengan libc Ubuntu 24.04
+    # ============================================================
+    runs-on: ubuntu-22.04
     timeout-minutes: 120
     steps:
 
       - name: 1. Checkout
         uses: actions/checkout@v4
 
-      - name: 2. Show inputs
+      - name: 2. Show environment info
         run: |
           echo "========================================"
-          echo "  MIUI 12 STOCK + KSU-NEXT + SUSFS v4"
-          echo "  (Fixed: HOSTLD pakai ld sistem)"
+          echo "  MIUI 12 + KSU-Next + SUSFS v5"
           echo "========================================"
+          echo "== Runner OS =="
+          cat /etc/os-release | head -3
+          echo ""
+          echo "== Runner architecture =="
+          uname -a
 
       - name: 3. Install deps
         run: |
@@ -83,7 +91,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/proton-clang
-          key: proton-clang-20210522
+          key: proton-clang-v5-ubuntu2204
 
       - name: 5. Download Proton Clang
         if: steps.clang-cache.outputs.cache-hit != 'true'
@@ -110,8 +118,26 @@ jobs:
           
           ~/proton-clang/bin/clang --version
 
-      - name: 6. Add Clang to PATH
-        run: echo "$HOME/proton-clang/bin" >> $GITHUB_PATH
+      # ============================================================
+      # STEP 6: Setup PATH (JANGAN taruh Proton Clang di depan!)
+      # ============================================================
+      # Sistem /usr/bin harus DIDULUKAN supaya HOSTCC pakai gcc sistem
+      # Proton Clang paths di-set MANUAL saja di make args (CC=clang path)
+      # ============================================================
+      - name: 6. Verify toolchains (jangan tambah Proton ke PATH global)
+        run: |
+          echo "== System tools =="
+          which gcc && gcc --version | head -1
+          which g++ && g++ --version | head -1
+          which ld && ld --version | head -1
+          which ar && ar --version | head -1
+          echo ""
+          echo "== Cross compile tools =="
+          which aarch64-linux-gnu-gcc && aarch64-linux-gnu-gcc --version | head -1
+          which arm-linux-gnueabi-gcc && arm-linux-gnueabi-gcc --version | head -1
+          echo ""
+          echo "== Proton Clang (dipakai dengan absolute path) =="
+          ~/proton-clang/bin/clang --version | head -1
 
       - name: 7. Clone MIUI 12 kernel source
         run: |
@@ -150,6 +176,15 @@ jobs:
 
           echo "Succeed: $(grep -c 'succeeded' /tmp/susfs.log)"
           echo "FAILED : $(grep -c 'FAILED' /tmp/susfs.log)"
+
+          # Simpan .rej untuk diagnosa
+          echo ""
+          echo "== .rej files (untuk diagnosa hunks yg gagal) =="
+          find . -name "*.rej" -not -path "./.susfs4ksu/*" 2>/dev/null | while read f; do
+            echo "--- $f ---"
+            cat "$f"
+            echo ""
+          done
 
           find . -name "*.rej" -not -path "./.susfs4ksu/*" -delete 2>/dev/null || true
           find . -name "*.orig" -not -path "./.susfs4ksu/*" -delete 2>/dev/null || true
@@ -322,7 +357,7 @@ jobs:
             echo "CONFIG_KPROBE_EVENTS=y"
             echo "CONFIG_KSU_KPROBE_HOOKS=y"
             echo ""
-            echo "# Namespace (WAJIB)"
+            echo "# Namespace"
             echo "CONFIG_UTS_NS=y"
             echo "CONFIG_PID_NS=y"
           } >> "$DEFCONFIG_PATH"
@@ -373,35 +408,46 @@ jobs:
           done
 
       # ============================================================
-      # STEP 15: Compile - PAKAI HOSTLD SISTEM (bukan ld.lld Proton)
+      # STEP 15: Compile - PATH sistem duluan, Proton hanya untuk CC
       # ============================================================
-      - name: 15. Compile Kernel (HOSTCC=gcc sistem)
+      - name: 15. Compile Kernel (PATH fix)
         run: |
           cd kernel-src
           OUT_DIR="out"
-          export PATH="$HOME/proton-clang/bin:$PATH"
-
-          echo "== Clang version =="
-          clang --version
+          
+          # KUNCI FIX PATH:
+          # Sistem /usr/bin duluan → HOSTCC/HOSTLD otomatis pakai sistem
+          # Proton Clang path DITARUH DI BELAKANG
+          # Karena CC=clang di make args pakai LOOKUP order dari PATH,
+          # dan Proton Clang path di belakang, kita pakai ABSOLUTE PATH
+          export PATH="/usr/bin:/bin:$HOME/proton-clang/bin"
+          
+          echo "== PATH order =="
+          echo "$PATH" | tr ':' '\n' | head -5
           echo ""
-          echo "== Host toolchain =="
-          gcc --version | head -1
-          ld --version | head -1
+          echo "== which gcc (harus /usr/bin/gcc) =="
+          which gcc
+          echo ""
+          echo "== which clang (harus proton-clang) =="
+          which clang
+          echo ""
+          echo "== which ld (harus /usr/bin/ld) =="
+          which ld
 
-          # KUNCI FIX: Override HOSTCC, HOSTCXX, HOSTLD, HOSTAR
-          # untuk pakai sistem native tools (bukan Proton Clang tools)
-          # Proton Clang ld.lld tidak kompat dengan libc Ubuntu 22.04
+          # Set absolute path untuk Clang toolchain
+          CLANG_PATH="$HOME/proton-clang/bin"
+
           MAKE_ARGS=(
             O=$OUT_DIR
             ARCH=arm64
-            CC=clang
-            LD=ld.lld
-            AR=llvm-ar
-            NM=llvm-nm
-            OBJCOPY=llvm-objcopy
-            OBJDUMP=llvm-objdump
-            STRIP=llvm-strip
-            READELF=llvm-readelf
+            CC=${CLANG_PATH}/clang
+            LD=${CLANG_PATH}/ld.lld
+            AR=${CLANG_PATH}/llvm-ar
+            NM=${CLANG_PATH}/llvm-nm
+            OBJCOPY=${CLANG_PATH}/llvm-objcopy
+            OBJDUMP=${CLANG_PATH}/llvm-objdump
+            STRIP=${CLANG_PATH}/llvm-strip
+            READELF=${CLANG_PATH}/llvm-readelf
             CLANG_TRIPLE=aarch64-linux-gnu-
             CROSS_COMPILE=aarch64-linux-gnu-
             CROSS_COMPILE_ARM32=arm-linux-gnueabi-
@@ -448,6 +494,7 @@ jobs:
           {
             "build_date": "$(date -u '+%Y-%m-%d %H:%M UTC')",
             "target_rom": "MIUI 12 Stock (Android 10)",
+            "runner": "ubuntu-22.04",
             "kernel": {
               "source": "${{ github.event.inputs.kernel_source }}",
               "branch": "${{ github.event.inputs.kernel_branch }}",
@@ -456,13 +503,14 @@ jobs:
               "defconfig": "${{ github.event.inputs.defconfig }}"
             },
             "toolchain": {
-              "target_cc": "Proton Clang",
+              "target_cc": "Proton Clang 13.0.0",
               "host_cc": "System GCC (Ubuntu 22.04)"
             },
             "kernelsu_next": {
               "tag": "${{ github.event.inputs.ksu_tag }}",
               "commit": "${KSU_COMMIT}",
-              "hook_method": "kprobe"
+              "hook_method": "kprobe",
+              "manager_apk": "Next_Manager from ThRE-Team/KernelSU-Next releases"
             },
             "susfs": {
               "enabled": "${{ github.event.inputs.enable_susfs }}",
@@ -476,7 +524,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log-miui12-ksunext-v4
+          name: build-log-miui12-ksunext-v5
           path: kernel-src/build.log
           retention-days: 7
 
@@ -492,6 +540,6 @@ jobs:
         if: env.BUILD_OK == '1'
         uses: actions/upload-artifact@v4
         with:
-          name: build-metadata-miui12-ksunext-v4
+          name: build-metadata-miui12-ksunext-v5
           path: build-metadata.json
           retention-days: 30
