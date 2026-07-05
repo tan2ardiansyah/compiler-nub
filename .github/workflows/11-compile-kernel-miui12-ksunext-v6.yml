@@ -1,4 +1,4 @@
-name: 11. Compile Kernel MIUI 12 Stock v5 - Ubuntu 22.04 fix
+name: 11. Compile Kernel MIUI 12 Stock v6 - Fix assembler
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       zip_name:
         description: 'Nama Build'
         required: true
-        default: 'miui12-beryllium-ksunext-susfs-v5'
+        default: 'miui12-beryllium-ksunext-susfs-v6'
       kernel_source:
         description: 'Kernel Source'
         required: true
@@ -52,10 +52,6 @@ env:
 jobs:
   build:
     name: ${{ github.event.inputs.zip_name }}
-    # ============================================================
-    # PENTING: Pin ke Ubuntu 22.04 (bukan latest / 24.04)
-    # Karena Proton Clang ld.lld tidak kompat dengan libc Ubuntu 24.04
-    # ============================================================
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     steps:
@@ -66,12 +62,10 @@ jobs:
       - name: 2. Show environment info
         run: |
           echo "========================================"
-          echo "  MIUI 12 + KSU-Next + SUSFS v5"
+          echo "  MIUI 12 + KSU-Next + SUSFS v6"
+          echo "  (Fix: assembler + double recipe)"
           echo "========================================"
-          echo "== Runner OS =="
           cat /etc/os-release | head -3
-          echo ""
-          echo "== Runner architecture =="
           uname -a
 
       - name: 3. Install deps
@@ -91,22 +85,18 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/proton-clang
-          key: proton-clang-v5-ubuntu2204
+          key: proton-clang-v6-ubuntu2204
 
       - name: 5. Download Proton Clang
         if: steps.clang-cache.outputs.cache-hit != 'true'
         run: |
-          echo "== Downloading Proton Clang =="
           mkdir -p ~/proton-clang
 
           PROTON_URL="https://github.com/kdrag0n/proton-clang/archive/refs/heads/master.tar.gz"
-          
           curl -L --fail -o /tmp/proton-clang.tar.gz "$PROTON_URL"
-          ls -lh /tmp/proton-clang.tar.gz
           FILE_SIZE=$(stat -c%s /tmp/proton-clang.tar.gz)
           
           if [ "$FILE_SIZE" -lt 100000000 ]; then
-            echo "[WARN] Fallback ke git clone..."
             rm -f /tmp/proton-clang.tar.gz
             git clone --depth=1 https://github.com/kdrag0n/proton-clang.git ~/proton-clang-git
             mv ~/proton-clang-git/* ~/proton-clang/
@@ -118,25 +108,17 @@ jobs:
           
           ~/proton-clang/bin/clang --version
 
-      # ============================================================
-      # STEP 6: Setup PATH (JANGAN taruh Proton Clang di depan!)
-      # ============================================================
-      # Sistem /usr/bin harus DIDULUKAN supaya HOSTCC pakai gcc sistem
-      # Proton Clang paths di-set MANUAL saja di make args (CC=clang path)
-      # ============================================================
-      - name: 6. Verify toolchains (jangan tambah Proton ke PATH global)
+      - name: 6. Verify toolchains
         run: |
           echo "== System tools =="
           which gcc && gcc --version | head -1
-          which g++ && g++ --version | head -1
           which ld && ld --version | head -1
-          which ar && ar --version | head -1
           echo ""
-          echo "== Cross compile tools =="
-          which aarch64-linux-gnu-gcc && aarch64-linux-gnu-gcc --version | head -1
-          which arm-linux-gnueabi-gcc && arm-linux-gnueabi-gcc --version | head -1
+          echo "== Cross tools =="
+          which aarch64-linux-gnu-as && aarch64-linux-gnu-as --version | head -1
+          which arm-linux-gnueabi-as && arm-linux-gnueabi-as --version | head -1
           echo ""
-          echo "== Proton Clang (dipakai dengan absolute path) =="
+          echo "== Proton Clang =="
           ~/proton-clang/bin/clang --version | head -1
 
       - name: 7. Clone MIUI 12 kernel source
@@ -145,19 +127,14 @@ jobs:
             "${{ github.event.inputs.kernel_source }}" \
             -b "${{ github.event.inputs.kernel_branch }}" \
             kernel-src
-
           cd kernel-src
           git log -1 --oneline
-          find arch/arm64/configs -iname "*beryllium*"
 
       - name: 8. Setup KernelSU-Next
         run: |
           cd kernel-src
           curl -LSs "${{ github.event.inputs.ksu_setup_url }}" | bash -s "${{ github.event.inputs.ksu_tag }}"
-
-          echo "== Verifikasi =="
           ls -la drivers/kernelsu || echo "MISSING!"
-          grep -n "kernelsu" drivers/Makefile || echo "MISSING in Makefile!"
 
       - name: 9. Clone SUSFS & apply patch
         if: github.event.inputs.enable_susfs == 'true'
@@ -176,15 +153,6 @@ jobs:
 
           echo "Succeed: $(grep -c 'succeeded' /tmp/susfs.log)"
           echo "FAILED : $(grep -c 'FAILED' /tmp/susfs.log)"
-
-          # Simpan .rej untuk diagnosa
-          echo ""
-          echo "== .rej files (untuk diagnosa hunks yg gagal) =="
-          find . -name "*.rej" -not -path "./.susfs4ksu/*" 2>/dev/null | while read f; do
-            echo "--- $f ---"
-            cat "$f"
-            echo ""
-          done
 
           find . -name "*.rej" -not -path "./.susfs4ksu/*" -delete 2>/dev/null || true
           find . -name "*.orig" -not -path "./.susfs4ksu/*" -delete 2>/dev/null || true
@@ -307,7 +275,12 @@ jobs:
           PYEOF
           fi
 
-      - name: 11. Fix MIUI kernel compat issues
+      # ============================================================
+      # STEP 11: FIX untuk kernel MIUI compatibility
+      # ============================================================
+      # Perbaikan: cek dulu apakah sudah ada fix untuk hindari duplicate
+      # ============================================================
+      - name: 11. Fix MIUI kernel compat issues (no double)
         run: |
           cd kernel-src
 
@@ -316,17 +289,25 @@ jobs:
           if [ -f "$DTC_MAKEFILE" ] && ! grep -q "fcommon" "$DTC_MAKEFILE"; then
             sed -i '1i HOSTCFLAGS_dtc.o += -fcommon\nHOSTCFLAGS_dtc-lexer.lex.o += -fcommon\nHOSTCFLAGS_dtc-parser.tab.o += -fcommon\n' "$DTC_MAKEFILE"
             echo "[OK] Added -fcommon"
+          else
+            echo "[SKIP] Already has -fcommon or file missing"
           fi
 
           echo ""
-          echo "== Fix 2: Bypass compiler check =="
+          echo "== Fix 2: Bypass compiler check (cek dulu supaya tidak double) =="
           MAKEFILE="Makefile"
-          if grep -q "prepare-compiler-check" "$MAKEFILE"; then
-            sed -i 's|prepare-compiler-check|prepare-compiler-check-skip|' "$MAKEFILE"
-            echo "" >> "$MAKEFILE"
-            echo "prepare-compiler-check-skip:" >> "$MAKEFILE"
-            printf "\t@echo 'Skipping compiler check'\n" >> "$MAKEFILE"
-            echo "[OK] Bypassed compiler check"
+          
+          # PENTING: cek 'prepare-compiler-check-skip:' (dengan colon) untuk avoid partial match
+          if ! grep -q "^prepare-compiler-check-skip:" "$MAKEFILE"; then
+            if grep -q "prepare-compiler-check" "$MAKEFILE"; then
+              sed -i 's|prepare-compiler-check|prepare-compiler-check-skip|g' "$MAKEFILE"
+              echo "" >> "$MAKEFILE"
+              echo "prepare-compiler-check-skip:" >> "$MAKEFILE"
+              printf "\t@echo 'Skipping compiler check'\n" >> "$MAKEFILE"
+              echo "[OK] Bypassed compiler check"
+            fi
+          else
+            echo "[SKIP] Compiler check already bypassed"
           fi
 
       - name: 12. Prepare defconfig
@@ -389,8 +370,6 @@ jobs:
             echo 'CONFIG_LOCALVERSION="-Nerf"'
           } >> "$DEFCONFIG_PATH"
 
-          grep -E "CONFIG_KSU|SUSFS|UTS_NS|PID_NS|STACKPROTECTOR|LOCALVERSION" "$DEFCONFIG_PATH" | sort
-
       - name: 13. Patch arch/arm64/Makefile
         run: |
           cd kernel-src
@@ -408,35 +387,28 @@ jobs:
           done
 
       # ============================================================
-      # STEP 15: Compile - PATH sistem duluan, Proton hanya untuk CC
+      # STEP 15: Compile - FIX assembler dengan AS override
       # ============================================================
-      - name: 15. Compile Kernel (PATH fix)
+      - name: 15. Compile Kernel (AS=aarch64-linux-gnu-as fix)
         run: |
           cd kernel-src
           OUT_DIR="out"
           
-          # KUNCI FIX PATH:
-          # Sistem /usr/bin duluan → HOSTCC/HOSTLD otomatis pakai sistem
-          # Proton Clang path DITARUH DI BELAKANG
-          # Karena CC=clang di make args pakai LOOKUP order dari PATH,
-          # dan Proton Clang path di belakang, kita pakai ABSOLUTE PATH
           export PATH="/usr/bin:/bin:$HOME/proton-clang/bin"
           
           echo "== PATH order =="
           echo "$PATH" | tr ':' '\n' | head -5
           echo ""
-          echo "== which gcc (harus /usr/bin/gcc) =="
-          which gcc
-          echo ""
-          echo "== which clang (harus proton-clang) =="
-          which clang
-          echo ""
-          echo "== which ld (harus /usr/bin/ld) =="
-          which ld
+          echo "== Toolchain check =="
+          which gcc && gcc --version | head -1
+          which clang && clang --version | head -1
+          which aarch64-linux-gnu-as && aarch64-linux-gnu-as --version | head -1
 
-          # Set absolute path untuk Clang toolchain
           CLANG_PATH="$HOME/proton-clang/bin"
 
+          # KUNCI FIX:
+          # AS=aarch64-linux-gnu-as → force pakai ARM64 assembler (bukan /usr/bin/as native)
+          # Ini fix untuk error: /usr/bin/as: unrecognized option '-EL'
           MAKE_ARGS=(
             O=$OUT_DIR
             ARCH=arm64
@@ -448,6 +420,7 @@ jobs:
             OBJDUMP=${CLANG_PATH}/llvm-objdump
             STRIP=${CLANG_PATH}/llvm-strip
             READELF=${CLANG_PATH}/llvm-readelf
+            AS=aarch64-linux-gnu-as
             CLANG_TRIPLE=aarch64-linux-gnu-
             CROSS_COMPILE=aarch64-linux-gnu-
             CROSS_COMPILE_ARM32=arm-linux-gnueabi-
@@ -504,13 +477,13 @@ jobs:
             },
             "toolchain": {
               "target_cc": "Proton Clang 13.0.0",
-              "host_cc": "System GCC (Ubuntu 22.04)"
+              "host_cc": "System GCC",
+              "as": "aarch64-linux-gnu-as"
             },
             "kernelsu_next": {
               "tag": "${{ github.event.inputs.ksu_tag }}",
               "commit": "${KSU_COMMIT}",
-              "hook_method": "kprobe",
-              "manager_apk": "Next_Manager from ThRE-Team/KernelSU-Next releases"
+              "hook_method": "kprobe"
             },
             "susfs": {
               "enabled": "${{ github.event.inputs.enable_susfs }}",
@@ -524,7 +497,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log-miui12-ksunext-v5
+          name: build-log-miui12-ksunext-v6
           path: kernel-src/build.log
           retention-days: 7
 
@@ -540,6 +513,6 @@ jobs:
         if: env.BUILD_OK == '1'
         uses: actions/upload-artifact@v4
         with:
-          name: build-metadata-miui12-ksunext-v5
+          name: build-metadata-miui12-ksunext-v6
           path: build-metadata.json
           retention-days: 30
