@@ -1,4 +1,4 @@
-name: 11. Compile Kernel MIUI 12 Stock v6 - Fix assembler
+name: 11. Compile Kernel MIUI 12 v8 - Poco F1 + KSU-Next (AOSP Clang, mirror BaikalOS workflow)
 
 on:
   workflow_dispatch:
@@ -6,9 +6,9 @@ on:
       zip_name:
         description: 'Nama Build'
         required: true
-        default: 'miui12-beryllium-ksunext-susfs-v6'
+        default: 'miui12-beryllium-ksunext-susfs-v8'
       kernel_source:
-        description: 'Kernel Source'
+        description: 'Kernel Source (MIUI 12 stock)'
         required: true
         default: 'https://github.com/MiCode/Xiaomi_Kernel_OpenSource.git'
       kernel_branch:
@@ -16,25 +16,17 @@ on:
         required: true
         default: 'dipper-q-oss'
       defconfig:
-        description: 'defconfig untuk beryllium'
+        description: 'defconfig path'
         required: true
         default: 'beryllium_user_defconfig'
       ksu_tag:
         description: 'KernelSU-Next tag'
         required: false
         default: 'v3.2.0'
-      ksu_setup_url:
-        description: 'KSU-Next setup script URL'
-        required: true
-        default: 'https://raw.githubusercontent.com/ThRE-Team/KernelSU-Next/main/kernel/setup.sh'
       enable_susfs:
         description: 'Apply SUSFS patch? (true/false)'
         required: true
         default: 'true'
-      susfs_repo:
-        description: 'SUSFS repo URL'
-        required: true
-        default: 'https://gitlab.com/simonpunk/susfs4ksu.git'
       susfs_branch:
         description: 'SUSFS branch'
         required: true
@@ -43,85 +35,61 @@ on:
         description: 'SUSFS patch URL'
         required: true
         default: 'https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/Patch/susfs_patch_to_4.9.patch'
-
-env:
-  KBUILD_BUILD_USER: "Nerf."
-  KBUILD_BUILD_HOST: "OldlineSSS"
-  ARCH: arm64
+      clang_url:
+        description: 'Clang prebuilt (SAMA dengan BaikalOS workflow yg berhasil)'
+        required: false
+        default: 'https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-release/clang-r487747c.tar.gz'
 
 jobs:
-  build:
+  test-build:
     name: ${{ github.event.inputs.zip_name }}
-    runs-on: ubuntu-22.04
-    timeout-minutes: 120
+    runs-on: ubuntu-latest    # SAMA seperti BaikalOS workflow
+    env:
+      KBUILD_BUILD_USER: "Nerf."
+      KBUILD_BUILD_HOST: "OldlineSSS"
     steps:
-
-      - name: 1. Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: 2. Show environment info
+      - name: Show Input
         run: |
-          echo "========================================"
-          echo "  MIUI 12 + KSU-Next + SUSFS v6"
-          echo "  (Fix: assembler + double recipe)"
-          echo "========================================"
-          cat /etc/os-release | head -3
-          uname -a
+          echo "kernel_source: ${{ github.event.inputs.kernel_source }}"
+          echo "kernel_branch: ${{ github.event.inputs.kernel_branch }}"
+          echo "defconfig: ${{ github.event.inputs.defconfig }}"
+          echo "ksu_tag: ${{ github.event.inputs.ksu_tag }}"
 
-      - name: 3. Install deps
+      - name: Install Build Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            bc build-essential flex bison ca-certificates \
-            libssl-dev libelf-dev cpio curl git unzip wget zip \
-            python3 python-is-python3 \
+            bc build-essential flex bison ca-certificates clang lld llvm \
+            libssl-dev libelf-dev cpio curl git unzip wget \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
             g++-aarch64-linux-gnu g++-arm-linux-gnueabi \
             binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
-            libncurses5-dev libncursesw5-dev patch jq
+            libncurses5-dev libncursesw5-dev python3 python-is-python3 patch jq
+          echo "== Cek lokasi arm-linux-gnueabi-as =="
+          which arm-linux-gnueabi-as || echo "TIDAK DITEMUKAN"
 
-      - name: 4. Setup Proton Clang cache
+      - name: Setup Clang Cache
         id: clang-cache
         uses: actions/cache@v4
         with:
-          path: ~/proton-clang
-          key: proton-clang-v6-ubuntu2204
+          path: ~/clang-ext
+          key: clang-${{ github.event.inputs.clang_url }}
 
-      - name: 5. Download Proton Clang
+      - name: Setup Clang
         if: steps.clang-cache.outputs.cache-hit != 'true'
         run: |
-          mkdir -p ~/proton-clang
+          mkdir -p ~/clang-ext
+          curl -Lo clang.tar.gz "${{ github.event.inputs.clang_url }}"
+          tar -xzf clang.tar.gz -C ~/clang-ext
+          rm -f clang.tar.gz
 
-          PROTON_URL="https://github.com/kdrag0n/proton-clang/archive/refs/heads/master.tar.gz"
-          curl -L --fail -o /tmp/proton-clang.tar.gz "$PROTON_URL"
-          FILE_SIZE=$(stat -c%s /tmp/proton-clang.tar.gz)
-          
-          if [ "$FILE_SIZE" -lt 100000000 ]; then
-            rm -f /tmp/proton-clang.tar.gz
-            git clone --depth=1 https://github.com/kdrag0n/proton-clang.git ~/proton-clang-git
-            mv ~/proton-clang-git/* ~/proton-clang/
-            rm -rf ~/proton-clang-git
-          else
-            tar -xzf /tmp/proton-clang.tar.gz -C ~/proton-clang --strip-components=1
-            rm -f /tmp/proton-clang.tar.gz
-          fi
-          
-          ~/proton-clang/bin/clang --version
+      - name: Add Clang to PATH
+        run: echo "$HOME/clang-ext/bin" >> $GITHUB_PATH
 
-      - name: 6. Verify toolchains
-        run: |
-          echo "== System tools =="
-          which gcc && gcc --version | head -1
-          which ld && ld --version | head -1
-          echo ""
-          echo "== Cross tools =="
-          which aarch64-linux-gnu-as && aarch64-linux-gnu-as --version | head -1
-          which arm-linux-gnueabi-as && arm-linux-gnueabi-as --version | head -1
-          echo ""
-          echo "== Proton Clang =="
-          ~/proton-clang/bin/clang --version | head -1
-
-      - name: 7. Clone MIUI 12 kernel source
+      - name: Clone MIUI 12 kernel source
         run: |
           git clone --depth=1 \
             "${{ github.event.inputs.kernel_source }}" \
@@ -129,50 +97,50 @@ jobs:
             kernel-src
           cd kernel-src
           git log -1 --oneline
+          find arch/arm64/configs -iname "*beryllium*"
 
-      - name: 8. Setup KernelSU-Next
+      - name: Setup KernelSU-Next
         run: |
           cd kernel-src
-          curl -LSs "${{ github.event.inputs.ksu_setup_url }}" | bash -s "${{ github.event.inputs.ksu_tag }}"
-          ls -la drivers/kernelsu || echo "MISSING!"
+          curl -LSs "https://raw.githubusercontent.com/ThRE-Team/KernelSU-Next/main/kernel/setup.sh" | bash -s "${{ github.event.inputs.ksu_tag }}"
 
-      - name: 9. Clone SUSFS & apply patch
+          echo "== Verify =="
+          ls -la drivers/kernelsu || echo "TIDAK ADA symlink!"
+          grep -n "kernelsu" drivers/Makefile || echo "TIDAK ADA di Makefile!"
+          grep -n "kernelsu" drivers/Kconfig || echo "TIDAK ADA di Kconfig!"
+
+      # ============================================================
+      # SUSFS integration
+      # ============================================================
+      - name: Clone SUSFS & apply patch
         if: github.event.inputs.enable_susfs == 'true'
         run: |
           cd kernel-src
           set -e
-
           git clone --depth=1 -b "${{ github.event.inputs.susfs_branch }}" \
-            "${{ github.event.inputs.susfs_repo }}" .susfs4ksu
-
+            https://gitlab.com/simonpunk/susfs4ksu.git .susfs4ksu
           curl -LSsf "${{ github.event.inputs.susfs_patch_url }}" -o /tmp/susfs.patch
-
           set +e
           patch -p1 --fuzz=3 --no-backup-if-mismatch --force < /tmp/susfs.patch 2>&1 | tee /tmp/susfs.log
           set -e
-
           echo "Succeed: $(grep -c 'succeeded' /tmp/susfs.log)"
           echo "FAILED : $(grep -c 'FAILED' /tmp/susfs.log)"
-
           find . -name "*.rej" -not -path "./.susfs4ksu/*" -delete 2>/dev/null || true
           find . -name "*.orig" -not -path "./.susfs4ksu/*" -delete 2>/dev/null || true
-
           if [ ! -f fs/sus_su.c ] && [ -f .susfs4ksu/kernel_patches/fs/sus_su.c ]; then
             cp .susfs4ksu/kernel_patches/fs/sus_su.c fs/sus_su.c
           fi
 
-      - name: 10. Manual fix SUSFS hunks
+      - name: Manual fix SUSFS hunks
         if: github.event.inputs.enable_susfs == 'true'
         run: |
           cd kernel-src
-
           if [ -f fs/proc_namespace.c ] && ! grep -q "susfs_def.h" fs/proc_namespace.c; then
             sed -i '/#include "proc\/internal.h"/a\
           #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\
           #include <linux/susfs_def.h>\
           #endif' fs/proc_namespace.c
           fi
-
           if [ -f fs/stat.c ] && ! grep -q "int err = inode->i_op->getattr" fs/stat.c; then
             python3 << 'PYEOF'
           import re
@@ -184,20 +152,16 @@ jobs:
               r'(\t\treturn inode->i_op->getattr\(path->mnt,\s*path->dentry,\s*stat\);)',
               re.MULTILINE
           )
-          replacement = (
-              r'\1'
+          replacement = (r'\1'
               '#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n\t{\n'
               '\t\tint err = inode->i_op->getattr(path->mnt, path->dentry, stat);\n'
               '\t\tif (!err)\n'
               '\t\t\tsusfs_sus_kstat_spoof_generic_fillattr(inode, stat);\n'
-              '\t\treturn err;\n\t}\n#else\n' r'\2' '\n#endif'
-          )
+              '\t\treturn err;\n\t}\n#else\n' r'\2' '\n#endif')
           new_text, n = pattern.subn(replacement, text)
-          if n > 0:
-              p.write_text(new_text)
+          if n > 0: p.write_text(new_text)
           PYEOF
           fi
-
           python3 << 'PYEOF'
           from pathlib import Path
           for filepath in ["fs/open.c", "fs/stat.c", "fs/proc_namespace.c", "fs/proc/task_mmu.c", "fs/proc/cmdline.c"]:
@@ -218,7 +182,6 @@ jobs:
               lines[insert_idx:insert_idx] = new_includes
               p.write_text('\n'.join(lines))
           PYEOF
-
           if [ -f fs/proc_namespace.c ] && ! grep -q "extern bool susfs_is_current_ksu_domain" fs/proc_namespace.c; then
             python3 << 'PYEOF'
           from pathlib import Path
@@ -237,7 +200,6 @@ jobs:
           p.write_text('\n'.join(new_lines))
           PYEOF
           fi
-
           if [ -f fs/stat.c ] && ! grep -q "extern void susfs_sus_kstat_spoof_generic_fillattr" fs/stat.c; then
             python3 << 'PYEOF'
           from pathlib import Path
@@ -253,7 +215,6 @@ jobs:
               p.write_text('\n'.join(lines))
           PYEOF
           fi
-
           if [ -f fs/stat.c ] && grep -q "^EXPORT_SYMBOL(vfs_getattr_nosec);$" fs/stat.c; then
             python3 << 'PYEOF'
           from pathlib import Path
@@ -276,69 +237,62 @@ jobs:
           fi
 
       # ============================================================
-      # STEP 11: FIX untuk kernel MIUI compatibility
+      # MIUI-specific fixes: bypass compiler check + fcommon
       # ============================================================
-      # Perbaikan: cek dulu apakah sudah ada fix untuk hindari duplicate
-      # ============================================================
-      - name: 11. Fix MIUI kernel compat issues (no double)
+      - name: Fix MIUI kernel compat issues
         run: |
           cd kernel-src
 
-          echo "== Fix 1: -fcommon HOSTCFLAGS untuk dtc =="
+          echo "== Fix -fcommon HOSTCFLAGS untuk dtc =="
           DTC_MAKEFILE="scripts/dtc/Makefile"
           if [ -f "$DTC_MAKEFILE" ] && ! grep -q "fcommon" "$DTC_MAKEFILE"; then
             sed -i '1i HOSTCFLAGS_dtc.o += -fcommon\nHOSTCFLAGS_dtc-lexer.lex.o += -fcommon\nHOSTCFLAGS_dtc-parser.tab.o += -fcommon\n' "$DTC_MAKEFILE"
             echo "[OK] Added -fcommon"
-          else
-            echo "[SKIP] Already has -fcommon or file missing"
           fi
 
           echo ""
-          echo "== Fix 2: Bypass compiler check (cek dulu supaya tidak double) =="
+          echo "== Bypass compiler check (no double) =="
           MAKEFILE="Makefile"
-          
-          # PENTING: cek 'prepare-compiler-check-skip:' (dengan colon) untuk avoid partial match
           if ! grep -q "^prepare-compiler-check-skip:" "$MAKEFILE"; then
             if grep -q "prepare-compiler-check" "$MAKEFILE"; then
               sed -i 's|prepare-compiler-check|prepare-compiler-check-skip|g' "$MAKEFILE"
               echo "" >> "$MAKEFILE"
               echo "prepare-compiler-check-skip:" >> "$MAKEFILE"
               printf "\t@echo 'Skipping compiler check'\n" >> "$MAKEFILE"
-              echo "[OK] Bypassed compiler check"
+              echo "[OK] Bypassed"
             fi
-          else
-            echo "[SKIP] Compiler check already bypassed"
           fi
 
-      - name: 12. Prepare defconfig
+      - name: Prepare defconfig (KSU-Next + SUSFS + MIUI namespace fix)
         run: |
           cd kernel-src
           DEFCONFIG_PATH="arch/arm64/configs/${{ github.event.inputs.defconfig }}"
 
           if [ ! -f "$DEFCONFIG_PATH" ]; then
-            echo "[FATAL] Defconfig tidak ditemukan"
+            echo "ERROR: $DEFCONFIG_PATH tidak ditemukan"
             find arch/arm64/configs -iname "*beryllium*"
             exit 1
           fi
 
+          # Bersihkan entry lama + disable stack protector strong
           sed -i '/^CONFIG_KSU/d;/^# CONFIG_KSU is not set/d;/SUSFS/d' "$DEFCONFIG_PATH"
           sed -i '/^CONFIG_CC_STACKPROTECTOR_STRONG=y/d' "$DEFCONFIG_PATH"
+
+          # Enable UTS_NS + PID_NS (MIUI disable, KSU butuh)
           sed -i 's|^# CONFIG_UTS_NS is not set|CONFIG_UTS_NS=y|' "$DEFCONFIG_PATH"
           sed -i 's|^# CONFIG_PID_NS is not set|CONFIG_PID_NS=y|' "$DEFCONFIG_PATH"
 
+          # Sesuai dokumentasi KSU-Next non-GKI
           {
             echo ""
-            echo "# Stack protector"
             echo "# CONFIG_CC_STACKPROTECTOR_STRONG is not set"
             echo "CONFIG_CC_STACKPROTECTOR_REGULAR=y"
             echo ""
-            echo "# KernelSU-Next"
             echo "CONFIG_KSU=y"
             echo "CONFIG_KPROBES=y"
             echo "CONFIG_KPROBE_EVENTS=y"
             echo "CONFIG_KSU_KPROBE_HOOKS=y"
             echo ""
-            echo "# Namespace"
             echo "CONFIG_UTS_NS=y"
             echo "CONFIG_PID_NS=y"
           } >> "$DEFCONFIG_PATH"
@@ -346,7 +300,6 @@ jobs:
           if [ "${{ github.event.inputs.enable_susfs }}" = "true" ]; then
             {
               echo ""
-              echo "# SUSFS"
               echo "CONFIG_KSU_SUSFS=y"
               echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
               echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
@@ -363,83 +316,103 @@ jobs:
 
           {
             echo ""
-            echo "# Filesystem"
             echo "CONFIG_TMPFS_XATTR=y"
-            echo ""
-            echo "# Custom branding"
             echo 'CONFIG_LOCALVERSION="-Nerf"'
           } >> "$DEFCONFIG_PATH"
 
-      - name: 13. Patch arch/arm64/Makefile
+          echo "== KSU/SUSFS/Namespace configs =="
+          grep -E "CONFIG_KSU|SUSFS|UTS_NS|PID_NS|STACKPROTECTOR|LOCALVERSION" "$DEFCONFIG_PATH" | sort
+
+      - name: Patch arch/arm64/Makefile (fix clang vdso32 "-EL" assembler error)
         run: |
           cd kernel-src
           MAIN_MK="arch/arm64/Makefile"
-          [ -f "$MAIN_MK" ] || exit 1
-          sed -i -E 's@(CLANG_PREFIX32[[:space:]]*:=[[:space:]]*--prefix=\$\(GCC_TOOLCHAIN32_DIR\))[[:space:]]*$@\1$(notdir $(CROSS_COMPILE_ARM32))@' "$MAIN_MK" 2>/dev/null || true
 
-      - name: 14. Skip broken DTBs
+          if [ ! -f "$MAIN_MK" ]; then
+            echo "ERROR: $MAIN_MK tidak ditemukan!"
+            exit 1
+          fi
+
+          echo "== Cari blok CLANG_PREFIX32 =="
+          grep -n "CLANG_PREFIX32\|GCC_TOOLCHAIN32\|CLANG_TARGET_ARM32\|CLANG_GCC32_TC" "$MAIN_MK" || echo "TIDAK DITEMUKAN!"
+
+          cp "$MAIN_MK" "$MAIN_MK.orig"
+
+          sed -i -E \
+            's@(CLANG_PREFIX32[[:space:]]*:=[[:space:]]*--prefix=\$\(GCC_TOOLCHAIN32_DIR\))[[:space:]]*$@\1$(notdir $(CROSS_COMPILE_ARM32))@' \
+            "$MAIN_MK"
+
+          if ! diff -q "$MAIN_MK" "$MAIN_MK.orig" > /dev/null; then
+            echo "[OK] Patch CLANG_PREFIX32 berhasil"
+            grep -n "CLANG_PREFIX32" "$MAIN_MK"
+          else
+            echo "[PERINGATAN] Pattern tidak match"
+            grep -n -B5 -A10 "CLANG_TARGET_ARM32\|CLANG_PREFIX32" "$MAIN_MK" || true
+          fi
+
+          rm -f "$MAIN_MK.orig"
+
+      - name: Skip DTB yang tidak relevan/rusak
         run: |
           cd kernel-src
           DTS_MK="arch/arm64/boot/dts/qcom/Makefile"
-          [ -f "$DTS_MK" ] || exit 0
-          for dtb in sdm845-v2-qvr-evt.dtb sdm845-v2-qvr-dvt.dtb sdm845-interposer-sdm670-mtp.dtb sdm845-interposer-sdm670-cdp.dtb; do
-            sed -i "/$dtb/d" "$DTS_MK" 2>/dev/null || true
+
+          if [ ! -f "$DTS_MK" ]; then
+            echo "PERINGATAN: $DTS_MK tidak ditemukan"
+            exit 0
+          fi
+
+          BROKEN_DTBS=(
+            "sdm845-v2-qvr-evt.dtb"
+            "sdm845-v2-qvr-dvt.dtb"
+            "sdm845-interposer-sdm670-mtp.dtb"
+            "sdm845-interposer-sdm670-cdp.dtb"
+          )
+
+          for dtb in "${BROKEN_DTBS[@]}"; do
+            if grep -q "$dtb" "$DTS_MK"; then
+              sed -i "/$dtb/d" "$DTS_MK"
+              echo "[OK] Dihapus: $dtb"
+            fi
           done
 
       # ============================================================
-      # STEP 15: Compile - FIX assembler dengan AS override
+      # COMPILE - PERSIS seperti BaikalOS workflow yg sukses
       # ============================================================
-      - name: 15. Compile Kernel (AS=aarch64-linux-gnu-as fix)
+      - name: Compile Kernel
         run: |
           cd kernel-src
           OUT_DIR="out"
-          
-          export PATH="/usr/bin:/bin:$HOME/proton-clang/bin"
-          
-          echo "== PATH order =="
-          echo "$PATH" | tr ':' '\n' | head -5
-          echo ""
-          echo "== Toolchain check =="
-          which gcc && gcc --version | head -1
-          which clang && clang --version | head -1
-          which aarch64-linux-gnu-as && aarch64-linux-gnu-as --version | head -1
+          export PATH="$HOME/clang-ext/bin:$PATH"
 
-          CLANG_PATH="$HOME/proton-clang/bin"
+          echo "== Clang version =="
+          clang --version
 
-          # KUNCI FIX:
-          # AS=aarch64-linux-gnu-as → force pakai ARM64 assembler (bukan /usr/bin/as native)
-          # Ini fix untuk error: /usr/bin/as: unrecognized option '-EL'
           MAKE_ARGS=(
             O=$OUT_DIR
             ARCH=arm64
-            CC=${CLANG_PATH}/clang
-            LD=${CLANG_PATH}/ld.lld
-            AR=${CLANG_PATH}/llvm-ar
-            NM=${CLANG_PATH}/llvm-nm
-            OBJCOPY=${CLANG_PATH}/llvm-objcopy
-            OBJDUMP=${CLANG_PATH}/llvm-objdump
-            STRIP=${CLANG_PATH}/llvm-strip
-            READELF=${CLANG_PATH}/llvm-readelf
-            AS=aarch64-linux-gnu-as
+            CC=clang
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+            READELF=llvm-readelf
             CLANG_TRIPLE=aarch64-linux-gnu-
             CROSS_COMPILE=aarch64-linux-gnu-
             CROSS_COMPILE_ARM32=arm-linux-gnueabi-
             LLVM=1
             LLVM_IAS=1
-            HOSTCC=/usr/bin/gcc
-            HOSTCXX=/usr/bin/g++
-            HOSTLD=/usr/bin/ld
-            HOSTAR=/usr/bin/ar
-            HOSTCFLAGS="-fcommon"
           )
 
           mkdir -p $OUT_DIR
           make "${MAKE_ARGS[@]}" ${{ github.event.inputs.defconfig }}
           make "${MAKE_ARGS[@]}" olddefconfig
 
-          echo "== Config check =="
-          for cfg in CONFIG_KSU CONFIG_KSU_KPROBE_HOOKS CONFIG_UTS_NS CONFIG_PID_NS; do
-            grep "^${cfg}=" $OUT_DIR/.config || echo "${cfg}=NOT SET"
+          echo "== Cek config KSU =="
+          for cfg in CONFIG_KSU CONFIG_KPROBES CONFIG_KPROBE_EVENTS CONFIG_KSU_KPROBE_HOOKS CONFIG_UTS_NS CONFIG_PID_NS; do
+            grep "^${cfg}=" $OUT_DIR/.config || echo "PERINGATAN: ${cfg} tidak aktif!"
           done
 
           set +e
@@ -447,72 +420,90 @@ jobs:
           BUILD_EXIT=${PIPESTATUS[0]}
           set -e
 
-          BUILD_OK=0
+          echo "== Exit code: $BUILD_EXIT =="
+
+          IMAGE_OK=0
+          IMAGE_GZ_DTB_OK=0
+          if [ -f "$OUT_DIR/arch/arm64/boot/Image" ]; then
+            ls -la "$OUT_DIR/arch/arm64/boot/Image"
+            IMAGE_OK=1
+          fi
           if [ -f "$OUT_DIR/arch/arm64/boot/Image.gz-dtb" ]; then
             ls -la "$OUT_DIR/arch/arm64/boot/Image.gz-dtb"
+            IMAGE_GZ_DTB_OK=1
+          fi
+
+          BUILD_OK=0
+          if [ "$IMAGE_GZ_DTB_OK" -eq 1 ]; then
+            echo "[OK] Image.gz-dtb sukses"
+            BUILD_OK=1
+          elif [ "$IMAGE_OK" -eq 1 ]; then
+            echo "[SEBAGIAN OK] Image ada, Image.gz-dtb belum"
             BUILD_OK=1
           fi
+
           echo "BUILD_OK=$BUILD_OK" >> "$GITHUB_ENV"
           [ "$BUILD_OK" -eq 1 ] || exit 1
 
-      - name: 16. Capture metadata
+      - name: Capture Build Metadata
         if: env.BUILD_OK == '1'
         run: |
           cd kernel-src
           KERNEL_COMMIT=$(git rev-parse --short HEAD)
+          KERNEL_COMMIT_FULL=$(git rev-parse HEAD)
           KSU_COMMIT=$(cd KernelSU-Next 2>/dev/null && git rev-parse --short HEAD || echo "unknown")
           SUSFS_COMMIT=$(cd .susfs4ksu 2>/dev/null && git rev-parse --short HEAD || echo "unknown")
+          KERNEL_VERSION_STRING=$(cat out/include/config/kernel.release 2>/dev/null || echo unknown)
+          BUILD_DATE=$(date -u '+%Y-%m-%d %H:%M UTC')
 
           cat > ../build-metadata.json << JSONEOF
           {
-            "build_date": "$(date -u '+%Y-%m-%d %H:%M UTC')",
-            "target_rom": "MIUI 12 Stock (Android 10)",
-            "runner": "ubuntu-22.04",
-            "kernel": {
-              "source": "${{ github.event.inputs.kernel_source }}",
-              "branch": "${{ github.event.inputs.kernel_branch }}",
-              "commit": "${KERNEL_COMMIT}",
-              "version": "$(cat out/include/config/kernel.release)",
-              "defconfig": "${{ github.event.inputs.defconfig }}"
-            },
-            "toolchain": {
-              "target_cc": "Proton Clang 13.0.0",
-              "host_cc": "System GCC",
-              "as": "aarch64-linux-gnu-as"
-            },
-            "kernelsu_next": {
-              "tag": "${{ github.event.inputs.ksu_tag }}",
-              "commit": "${KSU_COMMIT}",
-              "hook_method": "kprobe"
-            },
-            "susfs": {
-              "enabled": "${{ github.event.inputs.enable_susfs }}",
-              "commit": "${SUSFS_COMMIT}"
-            }
+            "build_date": "${BUILD_DATE}",
+            "target_rom": "MIUI 12 Stock",
+            "kernel_source": "${{ github.event.inputs.kernel_source }}",
+            "kernel_branch": "${{ github.event.inputs.kernel_branch }}",
+            "kernel_commit": "${KERNEL_COMMIT}",
+            "kernel_commit_full": "${KERNEL_COMMIT_FULL}",
+            "ksu_tag": "${{ github.event.inputs.ksu_tag }}",
+            "ksu_commit": "${KSU_COMMIT}",
+            "susfs_enabled": "${{ github.event.inputs.enable_susfs }}",
+            "susfs_commit": "${SUSFS_COMMIT}",
+            "kernel_version_string": "${KERNEL_VERSION_STRING}",
+            "defconfig": "${{ github.event.inputs.defconfig }}",
+            "clang_url": "${{ github.event.inputs.clang_url }}",
+            "zip_name": "${{ github.event.inputs.zip_name }}"
           }
           JSONEOF
+
+          echo "== Metadata =="
           cat ../build-metadata.json | jq .
 
-      - name: 17. Upload build log
+      - name: Upload Build Metadata
+        if: env.BUILD_OK == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-metadata
+          path: build-metadata.json
+          if-no-files-found: warn
+
+      - name: Upload Build Log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log-miui12-ksunext-v6
+          name: build-log
           path: kernel-src/build.log
-          retention-days: 7
+          if-no-files-found: warn
 
-      - name: 18. Upload Image
-        if: env.BUILD_OK == '1'
+      - name: Upload Image.gz-dtb
         uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.inputs.zip_name }}-gz-dtb
           path: kernel-src/out/arch/arm64/boot/Image.gz-dtb
-          retention-days: 30
+          if-no-files-found: ignore
 
-      - name: 19. Upload metadata
-        if: env.BUILD_OK == '1'
+      - name: Upload Image Only
         uses: actions/upload-artifact@v4
         with:
-          name: build-metadata-miui12-ksunext-v6
-          path: build-metadata.json
-          retention-days: 30
+          name: ${{ github.event.inputs.zip_name }}-raw
+          path: kernel-src/out/arch/arm64/boot/Image
+          if-no-files-found: ignore
