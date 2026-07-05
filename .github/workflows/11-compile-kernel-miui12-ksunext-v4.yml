@@ -1,4 +1,4 @@
-name: 11. Compile Kernel MIUI 12 Stock - Poco F1 + KernelSU-Next + SUSFS (v3 Proton Clang)
+name: 11. Compile Kernel MIUI 12 Stock - Poco F1 + KernelSU-Next + SUSFS (v4 host linker fix)
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       zip_name:
         description: 'Nama Build'
         required: true
-        default: 'miui12-beryllium-ksunext-susfs-v3'
+        default: 'miui12-beryllium-ksunext-susfs-v4'
       kernel_source:
         description: 'Kernel Source'
         required: true
@@ -62,8 +62,8 @@ jobs:
       - name: 2. Show inputs
         run: |
           echo "========================================"
-          echo "  MIUI 12 STOCK + KSU-NEXT + SUSFS v3"
-          echo "  (Proton Clang untuk kompatibilitas)"
+          echo "  MIUI 12 STOCK + KSU-NEXT + SUSFS v4"
+          echo "  (Fixed: HOSTLD pakai ld sistem)"
           echo "========================================"
 
       - name: 3. Install deps
@@ -78,9 +78,6 @@ jobs:
             binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
             libncurses5-dev libncursesw5-dev patch jq
 
-      # ============================================================
-      # STEP 4: Setup Proton Clang (RELIABLE untuk kernel Android)
-      # ============================================================
       - name: 4. Setup Proton Clang cache
         id: clang-cache
         uses: actions/cache@v4
@@ -94,37 +91,27 @@ jobs:
           echo "== Downloading Proton Clang =="
           mkdir -p ~/proton-clang
 
-          # Try multiple sources untuk reliability
           PROTON_URL="https://github.com/kdrag0n/proton-clang/archive/refs/heads/master.tar.gz"
           
-          echo "Downloading dari: $PROTON_URL"
           curl -L --fail -o /tmp/proton-clang.tar.gz "$PROTON_URL"
-          
-          echo "== File size check =="
           ls -lh /tmp/proton-clang.tar.gz
           FILE_SIZE=$(stat -c%s /tmp/proton-clang.tar.gz)
           
           if [ "$FILE_SIZE" -lt 100000000 ]; then
-            echo "[WARN] File terlalu kecil ($FILE_SIZE bytes), coba alternate source..."
-            # Alternate: clone Proton Clang repo langsung
+            echo "[WARN] Fallback ke git clone..."
             rm -f /tmp/proton-clang.tar.gz
             git clone --depth=1 https://github.com/kdrag0n/proton-clang.git ~/proton-clang-git
             mv ~/proton-clang-git/* ~/proton-clang/
             rm -rf ~/proton-clang-git
           else
-            echo "== Extract =="
             tar -xzf /tmp/proton-clang.tar.gz -C ~/proton-clang --strip-components=1
             rm -f /tmp/proton-clang.tar.gz
           fi
           
-          echo "== Verifikasi Clang =="
-          ls -la ~/proton-clang/bin/ | head -10
           ~/proton-clang/bin/clang --version
 
       - name: 6. Add Clang to PATH
-        run: |
-          echo "$HOME/proton-clang/bin" >> $GITHUB_PATH
-          echo "$HOME/proton-clang/lib" >> $GITHUB_PATH
+        run: echo "$HOME/proton-clang/bin" >> $GITHUB_PATH
 
       - name: 7. Clone MIUI 12 kernel source
         run: |
@@ -285,9 +272,6 @@ jobs:
           PYEOF
           fi
 
-      # ============================================================
-      # STEP 11: Fix MIUI kernel compatibility
-      # ============================================================
       - name: 11. Fix MIUI kernel compat issues
         run: |
           cd kernel-src
@@ -303,7 +287,6 @@ jobs:
           echo "== Fix 2: Bypass compiler check =="
           MAKEFILE="Makefile"
           if grep -q "prepare-compiler-check" "$MAKEFILE"; then
-            # Ganti dependency
             sed -i 's|prepare-compiler-check|prepare-compiler-check-skip|' "$MAKEFILE"
             echo "" >> "$MAKEFILE"
             echo "prepare-compiler-check-skip:" >> "$MAKEFILE"
@@ -322,23 +305,18 @@ jobs:
             exit 1
           fi
 
-          # Bersihkan entry lama
           sed -i '/^CONFIG_KSU/d;/^# CONFIG_KSU is not set/d;/SUSFS/d' "$DEFCONFIG_PATH"
-
-          # DISABLE stack protector strong (Clang modern check bermasalah)
           sed -i '/^CONFIG_CC_STACKPROTECTOR_STRONG=y/d' "$DEFCONFIG_PATH"
-
-          # ENABLE UTS_NS dan PID_NS (WAJIB untuk KSU)
           sed -i 's|^# CONFIG_UTS_NS is not set|CONFIG_UTS_NS=y|' "$DEFCONFIG_PATH"
           sed -i 's|^# CONFIG_PID_NS is not set|CONFIG_PID_NS=y|' "$DEFCONFIG_PATH"
 
           {
             echo ""
-            echo "# Stack protector (Clang modern fix)"
+            echo "# Stack protector"
             echo "# CONFIG_CC_STACKPROTECTOR_STRONG is not set"
             echo "CONFIG_CC_STACKPROTECTOR_REGULAR=y"
             echo ""
-            echo "# KernelSU-Next (kprobe hooks)"
+            echo "# KernelSU-Next"
             echo "CONFIG_KSU=y"
             echo "CONFIG_KPROBES=y"
             echo "CONFIG_KPROBE_EVENTS=y"
@@ -376,7 +354,6 @@ jobs:
             echo 'CONFIG_LOCALVERSION="-Nerf"'
           } >> "$DEFCONFIG_PATH"
 
-          echo "== Config final =="
           grep -E "CONFIG_KSU|SUSFS|UTS_NS|PID_NS|STACKPROTECTOR|LOCALVERSION" "$DEFCONFIG_PATH" | sort
 
       - name: 13. Patch arch/arm64/Makefile
@@ -395,16 +372,25 @@ jobs:
             sed -i "/$dtb/d" "$DTS_MK" 2>/dev/null || true
           done
 
-      - name: 15. Compile Kernel dengan Proton Clang
+      # ============================================================
+      # STEP 15: Compile - PAKAI HOSTLD SISTEM (bukan ld.lld Proton)
+      # ============================================================
+      - name: 15. Compile Kernel (HOSTCC=gcc sistem)
         run: |
           cd kernel-src
           OUT_DIR="out"
           export PATH="$HOME/proton-clang/bin:$PATH"
-          export LD_LIBRARY_PATH="$HOME/proton-clang/lib:$LD_LIBRARY_PATH"
 
           echo "== Clang version =="
           clang --version
+          echo ""
+          echo "== Host toolchain =="
+          gcc --version | head -1
+          ld --version | head -1
 
+          # KUNCI FIX: Override HOSTCC, HOSTCXX, HOSTLD, HOSTAR
+          # untuk pakai sistem native tools (bukan Proton Clang tools)
+          # Proton Clang ld.lld tidak kompat dengan libc Ubuntu 22.04
           MAKE_ARGS=(
             O=$OUT_DIR
             ARCH=arm64
@@ -421,6 +407,10 @@ jobs:
             CROSS_COMPILE_ARM32=arm-linux-gnueabi-
             LLVM=1
             LLVM_IAS=1
+            HOSTCC=/usr/bin/gcc
+            HOSTCXX=/usr/bin/g++
+            HOSTLD=/usr/bin/ld
+            HOSTAR=/usr/bin/ar
             HOSTCFLAGS="-fcommon"
           )
 
@@ -466,7 +456,8 @@ jobs:
               "defconfig": "${{ github.event.inputs.defconfig }}"
             },
             "toolchain": {
-              "clang": "Proton Clang (community build)"
+              "target_cc": "Proton Clang",
+              "host_cc": "System GCC (Ubuntu 22.04)"
             },
             "kernelsu_next": {
               "tag": "${{ github.event.inputs.ksu_tag }}",
@@ -485,7 +476,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log-miui12-ksunext-v3
+          name: build-log-miui12-ksunext-v4
           path: kernel-src/build.log
           retention-days: 7
 
@@ -501,6 +492,6 @@ jobs:
         if: env.BUILD_OK == '1'
         uses: actions/upload-artifact@v4
         with:
-          name: build-metadata-miui12-ksunext-v3
+          name: build-metadata-miui12-ksunext-v4
           path: build-metadata.json
           retention-days: 30
