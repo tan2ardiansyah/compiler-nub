@@ -44,15 +44,14 @@ on:
         required: true
         default: 'https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/Patch/susfs_patch_to_4.9.patch'
       clang_url:
-        description: 'Clang prebuilt'
+        description: 'Clang prebuilt (mirror di repo kita, reliable)'
         required: false
-        default: 'https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-release/clang-r487747c.tar.gz'
+        default: 'https://github.com/tan2ardiansyah/compiler-nub/releases/download/clang-toolchain/clang-r487747c.tar.gz'
 
 jobs:
   test-build:
     name: ${{ github.event.inputs.zip_name }}
     runs-on: ubuntu-latest
-    timeout-minutes: 120
     steps:
       - name: Checkout repo (untuk akses extracted-config/my_defconfig.txt)
         uses: actions/checkout@v4
@@ -65,7 +64,6 @@ jobs:
           echo "use_extracted_config: ${{ github.event.inputs.use_extracted_config }}"
           echo "ksu_tag: ${{ github.event.inputs.ksu_tag }}"
           echo "enable_susfs: ${{ github.event.inputs.enable_susfs }}"
-          echo "susfs_repo: ${{ github.event.inputs.susfs_repo }}"
           echo "susfs_branch: ${{ github.event.inputs.susfs_branch }}"
 
       - name: Install Build Dependencies
@@ -116,186 +114,6 @@ jobs:
           echo "== Cek entri Kconfig =="
           grep -n "kernelsu" drivers/Kconfig || echo "TIDAK ADA entri di drivers/Kconfig!"
 
-      # ============================================================
-      # SUSFS: Clone repo + apply patch
-      # ============================================================
-      - name: Clone SUSFS & apply patch
-        if: github.event.inputs.enable_susfs == 'true'
-        run: |
-          cd kernel-src
-          set -e
-          
-          echo "== Clone SUSFS repo =="
-          echo "URL   : ${{ github.event.inputs.susfs_repo }}"
-          echo "Branch: ${{ github.event.inputs.susfs_branch }}"
-          git clone --depth=1 -b "${{ github.event.inputs.susfs_branch }}" \
-            "${{ github.event.inputs.susfs_repo }}" .susfs4ksu
-          
-          echo ""
-          echo "== Download SUSFS patch =="
-          echo "URL: ${{ github.event.inputs.susfs_patch_url }}"
-          curl -LSsf "${{ github.event.inputs.susfs_patch_url }}" -o /tmp/susfs.patch
-          echo "Patch size: $(wc -c < /tmp/susfs.patch) bytes"
-          
-          echo ""
-          echo "== Apply patch =="
-          set +e
-          patch -p1 --fuzz=3 --no-backup-if-mismatch --force < /tmp/susfs.patch 2>&1 | tee /tmp/susfs.log
-          set -e
-          
-          echo ""
-          echo "== Hasil apply =="
-          echo "Succeed hunks: $(grep -c 'succeeded' /tmp/susfs.log)"
-          echo "FAILED hunks : $(grep -c 'FAILED' /tmp/susfs.log)"
-          
-          # Cleanup rej dan orig files
-          find . -name "*.rej" -not -path "./.susfs4ksu/*" -delete 2>/dev/null || true
-          find . -name "*.orig" -not -path "./.susfs4ksu/*" -delete 2>/dev/null || true
-          
-          # Copy sus_su.c (kalau belum dicover patch)
-          if [ ! -f fs/sus_su.c ] && [ -f .susfs4ksu/kernel_patches/fs/sus_su.c ]; then
-            cp .susfs4ksu/kernel_patches/fs/sus_su.c fs/sus_su.c
-            echo "[OK] Copied sus_su.c"
-          fi
-
-      # ============================================================
-      # Manual fix SUSFS hunks yang gagal
-      # ============================================================
-      - name: Manual fix SUSFS hunks
-        if: github.event.inputs.enable_susfs == 'true'
-        run: |
-          cd kernel-src
-          
-          # Fix 1: proc_namespace.c include susfs_def.h
-          if [ -f fs/proc_namespace.c ] && ! grep -q "susfs_def.h" fs/proc_namespace.c; then
-            sed -i '/#include "proc\/internal.h"/a\
-          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\
-          #include <linux/susfs_def.h>\
-          #endif' fs/proc_namespace.c
-            echo "[OK] fs/proc_namespace.c: added susfs_def.h include"
-          fi
-          
-          # Fix 2: wrap getattr di stat.c
-          if [ -f fs/stat.c ] && ! grep -q "int err = inode->i_op->getattr" fs/stat.c; then
-            python3 << 'PYEOF'
-          import re
-          from pathlib import Path
-          p = Path("fs/stat.c")
-          text = p.read_text()
-          pattern = re.compile(
-              r'(\tif\s*\(inode->i_op->getattr\)\s*\n)'
-              r'(\t\treturn inode->i_op->getattr\(path->mnt,\s*path->dentry,\s*stat\);)',
-              re.MULTILINE
-          )
-          replacement = (r'\1'
-              '#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n\t{\n'
-              '\t\tint err = inode->i_op->getattr(path->mnt, path->dentry, stat);\n'
-              '\t\tif (!err)\n'
-              '\t\t\tsusfs_sus_kstat_spoof_generic_fillattr(inode, stat);\n'
-              '\t\treturn err;\n\t}\n#else\n' r'\2' '\n#endif')
-          new_text, n = pattern.subn(replacement, text)
-          if n > 0:
-              p.write_text(new_text)
-              print("[OK] fs/stat.c: wrapped getattr with SUSFS")
-          PYEOF
-          fi
-          
-          # Fix 3: force include susfs.h + susfs_def.h ke file yang butuh
-          python3 << 'PYEOF'
-          from pathlib import Path
-          for filepath in ["fs/open.c", "fs/stat.c", "fs/proc_namespace.c", "fs/proc/task_mmu.c", "fs/proc/cmdline.c"]:
-              p = Path(filepath)
-              if not p.exists(): continue
-              lines = p.read_text().split('\n')
-              has_susfs = any('linux/susfs.h' in l for l in lines)
-              has_susfs_def = any('linux/susfs_def.h' in l for l in lines)
-              if has_susfs and has_susfs_def: continue
-              insert_idx = -1
-              for i, line in enumerate(lines):
-                  if line.strip().startswith('#include'):
-                      insert_idx = i
-                      break
-              if insert_idx == -1: continue
-              new_includes = []
-              if not has_susfs: new_includes.append('#include <linux/susfs.h>')
-              if not has_susfs_def: new_includes.append('#include <linux/susfs_def.h>')
-              lines[insert_idx:insert_idx] = new_includes
-              p.write_text('\n'.join(lines))
-              print(f"[OK] {filepath}: added includes {new_includes}")
-          PYEOF
-          
-          # Fix 4: extern declarations di proc_namespace.c
-          if [ -f fs/proc_namespace.c ] && ! grep -q "extern bool susfs_is_current_ksu_domain" fs/proc_namespace.c; then
-            python3 << 'PYEOF'
-          from pathlib import Path
-          p = Path("fs/proc_namespace.c")
-          lines = p.read_text().split('\n')
-          new_lines = []
-          inserted = False
-          for line in lines:
-              new_lines.append(line)
-              if not inserted and '#include "internal.h"' in line:
-                  new_lines.extend(['', '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT',
-                      'extern bool susfs_is_current_ksu_domain(void);',
-                      'extern bool susfs_hide_sus_mnts_for_non_su_procs;',
-                      '#endif', ''])
-                  inserted = True
-          p.write_text('\n'.join(new_lines))
-          if inserted:
-              print("[OK] fs/proc_namespace.c: added extern declarations")
-          PYEOF
-          fi
-          
-          # Fix 5: forward decl susfs_sus_kstat di stat.c
-          if [ -f fs/stat.c ] && ! grep -q "extern void susfs_sus_kstat_spoof_generic_fillattr" fs/stat.c; then
-            python3 << 'PYEOF'
-          from pathlib import Path
-          p = Path("fs/stat.c")
-          lines = p.read_text().split('\n')
-          last_include = -1
-          for i, line in enumerate(lines):
-              if line.strip().startswith('#include'): last_include = i
-          if last_include >= 0:
-              lines[last_include+1:last_include+1] = ['', '#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT',
-                  'extern void susfs_sus_kstat_spoof_generic_fillattr(struct inode *inode, struct kstat *stat);',
-                  '#endif', '']
-              p.write_text('\n'.join(lines))
-              print("[OK] fs/stat.c: added forward declaration")
-          PYEOF
-          fi
-          
-          # Fix 6: hapus stray call di stat.c setelah EXPORT_SYMBOL
-          if [ -f fs/stat.c ] && grep -q "^EXPORT_SYMBOL(vfs_getattr_nosec);$" fs/stat.c; then
-            python3 << 'PYEOF'
-          from pathlib import Path
-          p = Path("fs/stat.c")
-          lines = p.read_text().split('\n')
-          new_lines = []
-          i = 0
-          removed = False
-          while i < len(lines):
-              line = lines[i]
-              new_lines.append(line)
-              if (not removed and line.strip() == 'EXPORT_SYMBOL(vfs_getattr_nosec);' and i + 3 < len(lines)):
-                  if (lines[i+1].strip() == '#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT'
-                      and 'susfs_sus_kstat_spoof_generic_fillattr' in lines[i+2].strip()
-                      and lines[i+3].strip() == '#endif'):
-                      i += 4
-                      removed = True
-                      continue
-              i += 1
-          if removed:
-              p.write_text('\n'.join(new_lines))
-              print("[OK] fs/stat.c: removed stray call after EXPORT_SYMBOL")
-          PYEOF
-          fi
-
-      # ============================================================
-      # Prepare defconfig (extracted config + KSU + SUSFS)
-      # ============================================================
-      - name: Prepare defconfig (extracted config + KSU + SUSFS)
-        run: |
-          cd kernel-src
           DEFCONFIG_PATH="arch/arm64/configs/${{ github.event.inputs.defconfig }}"
 
           if [ ! -f "$DEFCONFIG_PATH" ]; then
@@ -323,10 +141,6 @@ jobs:
             fi
           fi
 
-          # Bersihkan entry lama KSU/SUSFS (biar tidak duplicate)
-          sed -i '/^CONFIG_KSU/d;/^# CONFIG_KSU is not set/d' "$DEFCONFIG_PATH"
-          sed -i '/SUSFS/d' "$DEFCONFIG_PATH"
-
           # Tambahkan config KSU (idempotent: defconfig kernel mengabaikan duplikat,
           # baris terakhir untuk key yang sama akan dipakai oleh olddefconfig).
           # Daftar ini mengikuti PERSIS dokumentasi resmi integrasi non-GKI KernelSU-Next
@@ -334,47 +148,210 @@ jobs:
           # tidak punya CONFIG_KSU_KPROBE_HOOKS):
           # https://kernelsu-next.github.io/webpage/pages/how-to-integrate-for-non-gki.html
           {
-            echo ""
-            echo "# === KernelSU-Next (kprobe hooks) ==="
             echo "CONFIG_KSU=y"
             echo "CONFIG_KPROBES=y"
             echo "CONFIG_KPROBE_EVENTS=y"
             echo "CONFIG_KSU_KPROBE_HOOKS=y"
           } >> "$DEFCONFIG_PATH"
-          
-          # Tambahkan config SUSFS jika enabled
-          if [ "${{ github.event.inputs.enable_susfs }}" = "true" ]; then
-            {
-              echo ""
-              echo "# === SUSFS ==="
-              echo "CONFIG_KSU_SUSFS=y"
-              echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
-              echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
-              echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
-              echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
-              echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
-              echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
-              echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
-              echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
-              echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
-              echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
-            } >> "$DEFCONFIG_PATH"
-            echo "[INFO] SUSFS configs ditambahkan ke defconfig."
-          fi
-          
-          # Additional filesystem support
-          {
-            echo ""
-            echo "# === Filesystem ==="
-            echo "CONFIG_OVERLAY_FS=y"
-            echo "CONFIG_TMPFS_XATTR=y"
-          } >> "$DEFCONFIG_PATH"
+          echo "Defconfig $DEFCONFIG_PATH berhasil dipatch dengan opsi KSU."
+
+      # ============================================================
+      # SUSFS: Clone repo + apply patch (langkah TAMBAHAN)
+      # ============================================================
+      - name: Clone SUSFS & apply patch
+        if: github.event.inputs.enable_susfs == 'true'
+        run: |
+          cd kernel-src
+          set -e
+
+          echo "== Clone SUSFS repo =="
+          echo "URL   : ${{ github.event.inputs.susfs_repo }}"
+          echo "Branch: ${{ github.event.inputs.susfs_branch }}"
+          git clone --depth=1 -b "${{ github.event.inputs.susfs_branch }}" \
+            "${{ github.event.inputs.susfs_repo }}" .susfs4ksu
 
           echo ""
-          echo "== KSU/SUSFS config check =="
-          grep -E "CONFIG_KSU|SUSFS|OVERLAY" "$DEFCONFIG_PATH" | sort
-          
-          echo "Defconfig $DEFCONFIG_PATH berhasil dipatch dengan opsi KSU + SUSFS."
+          echo "== Download SUSFS patch =="
+          curl -LSsf "${{ github.event.inputs.susfs_patch_url }}" -o /tmp/susfs.patch
+          echo "Patch size: $(wc -c < /tmp/susfs.patch) bytes"
+
+          echo ""
+          echo "== Apply patch =="
+          set +e
+          patch -p1 --fuzz=3 --no-backup-if-mismatch --force < /tmp/susfs.patch 2>&1 | tee /tmp/susfs.log
+          set -e
+
+          echo ""
+          echo "== Hasil apply =="
+          echo "Succeed hunks: $(grep -c 'succeeded' /tmp/susfs.log)"
+          echo "FAILED hunks : $(grep -c 'FAILED' /tmp/susfs.log)"
+
+          find . -name "*.rej" -not -path "./.susfs4ksu/*" -delete 2>/dev/null || true
+          find . -name "*.orig" -not -path "./.susfs4ksu/*" -delete 2>/dev/null || true
+
+          if [ ! -f fs/sus_su.c ] && [ -f .susfs4ksu/kernel_patches/fs/sus_su.c ]; then
+            cp .susfs4ksu/kernel_patches/fs/sus_su.c fs/sus_su.c
+            echo "[OK] Copied sus_su.c"
+          fi
+
+      - name: Manual fix SUSFS hunks yang gagal
+        if: github.event.inputs.enable_susfs == 'true'
+        run: |
+          cd kernel-src
+
+          # Fix 1: proc_namespace.c tambah susfs_def.h
+          if [ -f fs/proc_namespace.c ] && ! grep -q "susfs_def.h" fs/proc_namespace.c; then
+            sed -i '/#include "proc\/internal.h"/a\
+          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\
+          #include <linux/susfs_def.h>\
+          #endif' fs/proc_namespace.c
+            echo "[OK] fs/proc_namespace.c: added susfs_def.h include"
+          fi
+
+          # Fix 2: wrap getattr di stat.c
+          if [ -f fs/stat.c ] && ! grep -q "int err = inode->i_op->getattr" fs/stat.c; then
+            python3 << 'PYEOF'
+          import re
+          from pathlib import Path
+          p = Path("fs/stat.c")
+          text = p.read_text()
+          pattern = re.compile(
+              r'(\tif\s*\(inode->i_op->getattr\)\s*\n)'
+              r'(\t\treturn inode->i_op->getattr\(path->mnt,\s*path->dentry,\s*stat\);)',
+              re.MULTILINE
+          )
+          replacement = (r'\1'
+              '#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n\t{\n'
+              '\t\tint err = inode->i_op->getattr(path->mnt, path->dentry, stat);\n'
+              '\t\tif (!err)\n'
+              '\t\t\tsusfs_sus_kstat_spoof_generic_fillattr(inode, stat);\n'
+              '\t\treturn err;\n\t}\n#else\n' r'\2' '\n#endif')
+          new_text, n = pattern.subn(replacement, text)
+          if n > 0:
+              p.write_text(new_text)
+              print("[OK] fs/stat.c: wrapped getattr")
+          PYEOF
+          fi
+
+          # Fix 3: force include susfs.h + susfs_def.h
+          python3 << 'PYEOF'
+          from pathlib import Path
+          for filepath in ["fs/open.c", "fs/stat.c", "fs/proc_namespace.c", "fs/proc/task_mmu.c", "fs/proc/cmdline.c"]:
+              p = Path(filepath)
+              if not p.exists(): continue
+              lines = p.read_text().split('\n')
+              has_susfs = any('linux/susfs.h' in l for l in lines)
+              has_susfs_def = any('linux/susfs_def.h' in l for l in lines)
+              if has_susfs and has_susfs_def: continue
+              insert_idx = -1
+              for i, line in enumerate(lines):
+                  if line.strip().startswith('#include'):
+                      insert_idx = i
+                      break
+              if insert_idx == -1: continue
+              new_includes = []
+              if not has_susfs: new_includes.append('#include <linux/susfs.h>')
+              if not has_susfs_def: new_includes.append('#include <linux/susfs_def.h>')
+              lines[insert_idx:insert_idx] = new_includes
+              p.write_text('\n'.join(lines))
+              print(f"[OK] {filepath}: added includes")
+          PYEOF
+
+          # Fix 4: extern declarations di proc_namespace.c
+          if [ -f fs/proc_namespace.c ] && ! grep -q "extern bool susfs_is_current_ksu_domain" fs/proc_namespace.c; then
+            python3 << 'PYEOF'
+          from pathlib import Path
+          p = Path("fs/proc_namespace.c")
+          lines = p.read_text().split('\n')
+          new_lines = []
+          inserted = False
+          for line in lines:
+              new_lines.append(line)
+              if not inserted and '#include "internal.h"' in line:
+                  new_lines.extend(['', '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT',
+                      'extern bool susfs_is_current_ksu_domain(void);',
+                      'extern bool susfs_hide_sus_mnts_for_non_su_procs;',
+                      '#endif', ''])
+                  inserted = True
+          p.write_text('\n'.join(new_lines))
+          if inserted:
+              print("[OK] fs/proc_namespace.c: added extern decl")
+          PYEOF
+          fi
+
+          # Fix 5: forward decl di stat.c
+          if [ -f fs/stat.c ] && ! grep -q "extern void susfs_sus_kstat_spoof_generic_fillattr" fs/stat.c; then
+            python3 << 'PYEOF'
+          from pathlib import Path
+          p = Path("fs/stat.c")
+          lines = p.read_text().split('\n')
+          last_include = -1
+          for i, line in enumerate(lines):
+              if line.strip().startswith('#include'): last_include = i
+          if last_include >= 0:
+              lines[last_include+1:last_include+1] = ['', '#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT',
+                  'extern void susfs_sus_kstat_spoof_generic_fillattr(struct inode *inode, struct kstat *stat);',
+                  '#endif', '']
+              p.write_text('\n'.join(lines))
+              print("[OK] fs/stat.c: added forward declaration")
+          PYEOF
+          fi
+
+          # Fix 6: hapus stray call setelah EXPORT_SYMBOL
+          if [ -f fs/stat.c ] && grep -q "^EXPORT_SYMBOL(vfs_getattr_nosec);$" fs/stat.c; then
+            python3 << 'PYEOF'
+          from pathlib import Path
+          p = Path("fs/stat.c")
+          lines = p.read_text().split('\n')
+          new_lines = []
+          i = 0
+          removed = False
+          while i < len(lines):
+              line = lines[i]
+              new_lines.append(line)
+              if (not removed and line.strip() == 'EXPORT_SYMBOL(vfs_getattr_nosec);' and i + 3 < len(lines)):
+                  if (lines[i+1].strip() == '#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT'
+                      and 'susfs_sus_kstat_spoof_generic_fillattr' in lines[i+2].strip()
+                      and lines[i+3].strip() == '#endif'):
+                      i += 4
+                      removed = True
+                      continue
+              i += 1
+          if removed:
+              p.write_text('\n'.join(new_lines))
+              print("[OK] fs/stat.c: removed stray call")
+          PYEOF
+          fi
+
+      # ============================================================
+      # APPEND SUSFS config ke defconfig (langkah TAMBAHAN)
+      # Ini di-append SETELAH KSU config, sebelum patch Makefile
+      # ============================================================
+      - name: Append SUSFS config ke defconfig
+        if: github.event.inputs.enable_susfs == 'true'
+        run: |
+          cd kernel-src
+          DEFCONFIG_PATH="arch/arm64/configs/${{ github.event.inputs.defconfig }}"
+
+          # Append SUSFS config
+          {
+            echo ""
+            echo "# === SUSFS (dari step Append SUSFS config) ==="
+            echo "CONFIG_KSU_SUSFS=y"
+            echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
+            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+            echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
+            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
+            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
+            echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
+            echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
+            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
+          } >> "$DEFCONFIG_PATH"
+
+          echo "== Verify SUSFS di defconfig =="
+          grep -E "CONFIG_KSU_SUSFS" "$DEFCONFIG_PATH" | head -15
 
       - name: Patch arch/arm64/Makefile (fix clang vdso32 "-EL" assembler error)
         run: |
@@ -393,11 +370,6 @@ jobs:
 
           # Fix resmi: arm64: vdso32: Fix '--prefix=' value for newer versions of clang
           # https://github.com/ClangBuiltLinux/linux/issues/1099
-          # CLANG_PREFIX32 harus menyertakan nama prefix CROSS_COMPILE_ARM32, bukan cuma direktorinya.
-          # Pattern asli biasanya:
-          #   export CLANG_PREFIX32 := --prefix=$(GCC_TOOLCHAIN32_DIR)
-          # diubah jadi:
-          #   export CLANG_PREFIX32 := --prefix=$(GCC_TOOLCHAIN32_DIR)$(notdir $(CROSS_COMPILE_ARM32))
           sed -i -E \
             's@(CLANG_PREFIX32[[:space:]]*:=[[:space:]]*--prefix=\$\(GCC_TOOLCHAIN32_DIR\))[[:space:]]*$@\1$(notdir $(CROSS_COMPILE_ARM32))@' \
             "$MAIN_MK"
@@ -424,10 +396,6 @@ jobs:
             exit 0
           fi
 
-          # 4 dtb ini BUKAN untuk Poco F1/beryllium (QVR = Qualcomm VR reference headset,
-          # interposer-sdm670 = board test interposer), dan rusak (phandle reference hilang)
-          # di kernel source ini. Kita hapus dari daftar build supaya target `dtbs`
-          # (yang menjadi dependency Image.gz-dtb) bisa sukses sepenuhnya.
           BROKEN_DTBS=(
             "sdm845-v2-qvr-evt.dtb"
             "sdm845-v2-qvr-dvt.dtb"
@@ -564,7 +532,7 @@ jobs:
           JSONEOF
 
           echo "== Isi build-metadata.json =="
-          cat ../build-metadata.json | jq .
+          cat ../build-metadata.json
 
       - name: Upload Build Metadata
         if: env.BUILD_OK == '1'
