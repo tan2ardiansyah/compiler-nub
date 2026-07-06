@@ -1,4 +1,9 @@
-name: 12. Compile Kernel - BOS Beryllium + KSU-Next + SUSFS v2.1.0
+name: TEST4. Compile Kernel - BOS Beryllium + KSU-Next + SUSFS (Percobaan)
+
+# Pola: BaikalOS 13.0 + KSU-Next (v3.3.0-enjoy dari ThRE-Team, terbukti compile di kernel 4.9)
+# + SUSFS kernel-4.9 dengan cara yang benar (copy file dulu, baru patch).
+# Referensi fix: https://github.com/KernelSU-Next/KernelSU-Next/issues/426
+# Copy fs/* dan include/linux/* dulu sebelum patch, karena patch tidak bisa membuat file baru.
 
 on:
   workflow_dispatch:
@@ -6,9 +11,9 @@ on:
       zip_name:
         description: 'Nama Build'
         required: true
-        default: 'bos-beryllium-ksunext-susfs'
+        default: 'test-bos-ksunext-susfs'
       kernel_source:
-        description: 'Kernel Source (BaikalOS)'
+        description: 'Kernel Source'
         required: true
         default: 'https://github.com/baikalos/android_kernel_xiaomi_sdm845.git'
       kernel_branch:
@@ -19,18 +24,14 @@ on:
         description: 'defconfig path'
         required: true
         default: 'vendor/xiaomi/mi845_defconfig'
-      use_extracted_config:
-        description: 'Pakai extracted config dari boot.img BaikalOS? (true/false)'
-        required: true
-        default: 'true'
-      andrey_ksu_repo:
-        description: 'Andrey repo (KSU-Next + SUSFS v2.1.0 pre-integrated)'
-        required: true
-        default: 'https://github.com/Andrey0800770/samsung_sdm845-kernel.git'
-      andrey_ksu_branch:
-        description: 'Andrey branch'
-        required: true
-        default: 'ksu+susfs'
+      ksu_tag:
+        description: 'KernelSU-Next tag/branch dari ThRE-Team'
+        required: false
+        default: 'v3.3.0-enjoy'
+      susfs_branch:
+        description: 'SUSFS branch dari simonpunk/susfs4ksu'
+        required: false
+        default: 'kernel-4.9'
       clang_url:
         description: 'Clang prebuilt'
         required: false
@@ -40,32 +41,27 @@ jobs:
   test-build:
     name: ${{ github.event.inputs.zip_name }}
     runs-on: ubuntu-latest
-    env:
-      KBUILD_BUILD_USER: "Nerf."
-      KBUILD_BUILD_HOST: "OldlineSSS"
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Show Input
         run: |
-          echo "kernel_source: ${{ github.event.inputs.kernel_source }}"
-          echo "kernel_branch: ${{ github.event.inputs.kernel_branch }}"
-          echo "defconfig: ${{ github.event.inputs.defconfig }}"
-          echo "use_extracted_config: ${{ github.event.inputs.use_extracted_config }}"
-          echo "andrey_ksu_repo: ${{ github.event.inputs.andrey_ksu_repo }}"
-          echo "andrey_ksu_branch: ${{ github.event.inputs.andrey_ksu_branch }}"
+          echo "kernel_source : ${{ github.event.inputs.kernel_source }}"
+          echo "kernel_branch : ${{ github.event.inputs.kernel_branch }}"
+          echo "ksu_tag       : ${{ github.event.inputs.ksu_tag }}"
+          echo "susfs_branch  : ${{ github.event.inputs.susfs_branch }}"
 
       - name: Install Build Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             bc build-essential flex bison ca-certificates clang lld llvm \
-            libssl-dev libelf-dev cpio curl git unzip wget \
+            libssl-dev libelf-dev cpio curl git unzip wget patch \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
             g++-aarch64-linux-gnu g++-arm-linux-gnueabi \
             binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
-            libncurses5-dev libncursesw5-dev python3 python-is-python3 patch jq
+            libncurses5-dev libncursesw5-dev
 
       - name: Setup Clang Cache
         id: clang-cache
@@ -85,338 +81,188 @@ jobs:
       - name: Add Clang to PATH
         run: echo "$HOME/clang-ext/bin" >> $GITHUB_PATH
 
-      - name: Clone BaikalOS kernel source
+      - name: Clone Kernel Source (BaikalOS)
         run: |
           git clone --depth=1 "${{ github.event.inputs.kernel_source }}" \
             -b "${{ github.event.inputs.kernel_branch }}" kernel-src
-          cd kernel-src
-          git log -1 --oneline
 
-      - name: Import KSU-Next + SUSFS (hybrid Andrey + JackA1ltman)
+      - name: Setup KernelSU-Next (ThRE-Team, v3.3.0-enjoy)
         run: |
           cd kernel-src
-          
-          echo "== Clone Andrey source (untuk KSU-Next driver + SUSFS source) =="
+          curl -LSs "https://raw.githubusercontent.com/ThRE-Team/KernelSU-Next/main/kernel/setup.sh" \
+            | bash -s "${{ github.event.inputs.ksu_tag }}"
+          echo "== Cek symlink KSU =="
+          ls -la drivers/kernelsu || echo "TIDAK ADA symlink drivers/kernelsu!"
+          grep -n "kernelsu" drivers/Makefile | head -3 || echo "TIDAK ADA entri Makefile!"
+          grep -n "kernelsu" drivers/Kconfig | head -3 || echo "TIDAK ADA entri Kconfig!"
+
+      - name: Setup SUSFS (kernel-4.9) - copy file dulu, baru patch
+        run: |
+          cd kernel-src
+
+          # Clone susfs4ksu branch kernel-4.9
           git clone --depth=1 \
-            -b "${{ github.event.inputs.andrey_ksu_branch }}" \
-            "${{ github.event.inputs.andrey_ksu_repo }}" \
-            /tmp/andrey-src
-          
-          echo ""
-          echo "== Copy drivers/kernelsu/ dari Andrey (KSU-Next + SUSFS Kconfig) =="
-          cp -r /tmp/andrey-src/drivers/kernelsu drivers/
-          echo "[OK] drivers/kernelsu imported"
-          
-          echo ""
-          echo "== Copy SUSFS source files dari Andrey =="
-          for f in fs/susfs.c fs/sus_su.c include/linux/susfs.h include/linux/susfs_def.h; do
-            if [ -f "/tmp/andrey-src/$f" ]; then
-              cp "/tmp/andrey-src/$f" "$f"
-              echo "[OK] Copied $f"
-            fi
-          done
-          
-          echo ""
-          echo "== Register drivers/kernelsu ke Makefile + Kconfig =="
-          if ! grep -q "kernelsu" drivers/Makefile; then
-            echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
-            echo "[OK] Added kernelsu to drivers/Makefile"
-          fi
-          if ! grep -q "kernelsu" drivers/Kconfig; then
-            sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-            echo "[OK] Added kernelsu to drivers/Kconfig"
-          fi
-          
-          echo ""
-          echo "== Add susfs.o + sus_su.o ke fs/Makefile =="
-          if ! grep -q "susfs.o" fs/Makefile; then
-            sed -i '0,/^obj-y[[:space:]]*+=/{s|^obj-y[[:space:]]*+=.*|&\nobj-y += susfs.o sus_su.o|}' fs/Makefile
-            echo "[OK] Added susfs.o sus_su.o to fs/Makefile"
-          fi
-          
-          echo ""
-          echo "== Verify =="
-          grep "SUSFS_VERSION" include/linux/susfs.h | head -3
-          grep "config KSU_SUSFS" drivers/kernelsu/Kconfig | head -5
-          grep "susfs" fs/Makefile | head -5
-          
-          rm -rf /tmp/andrey-src
+            -b "${{ github.event.inputs.susfs_branch }}" \
+            "https://gitlab.com/simonpunk/susfs4ksu.git" susfs4ksu-src
 
-      # ============================================================
-      # Apply SUSFS kernel patches dari JackA1ltman (untuk BaikalOS)
-      # File kernel core BaikalOS berbeda dari Samsung, jadi pakai
-      # patch JackA1ltman yang sudah proven match di BaikalOS
-      # ============================================================
-      - name: Apply SUSFS kernel patches (JackA1ltman untuk BaikalOS)
-        run: |
-          cd kernel-src
-          
-          echo "== Download SUSFS patch =="
-          curl -LSsf "https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/Patch/susfs_patch_to_4.9.patch" -o /tmp/susfs.patch
-          
-          echo ""
-          echo "== Filter patch: SKIP file yang sudah di-copy dari Andrey =="
-          # Bikin patch yang SKIP fs/susfs.c, include/linux/susfs.h, dll
-          # Karena file itu sudah ada (dari Andrey v2.1.0)
-          # Hanya apply patch ke kernel core files (fs/namei.c, fs/stat.c, dll)
-          python3 << 'PYEOF'
-          import re
+          echo "== Struktur kernel_patches/ =="
+          ls -la susfs4ksu-src/kernel_patches/
+          ls -la susfs4ksu-src/kernel_patches/fs/ 2>/dev/null || echo "(tidak ada subfolder fs/)"
+          ls -la susfs4ksu-src/kernel_patches/include/linux/ 2>/dev/null || echo "(tidak ada subfolder include/linux/)"
+          ls -la susfs4ksu-src/kernel_patches/KernelSU/ 2>/dev/null || echo "(tidak ada subfolder KernelSU/)"
 
-          with open('/tmp/susfs.patch', 'r') as f:
-              patch_content = f.read()
-
-          # File yang HARUS SKIP (sudah di-copy dari Andrey)
-          skip_files = [
-              'fs/susfs.c',
-              'fs/sus_su.c',
-              'include/linux/susfs.h',
-              'include/linux/susfs_def.h',
-              'fs/Makefile',        # sudah kita modify manual
-          ]
-
-          # Split patch per-file
-          file_patches = re.split(r'(?=^diff --git)', patch_content, flags=re.MULTILINE)
-          
-          filtered = []
-          for fp in file_patches:
-              skip = False
-              for sf in skip_files:
-                  if sf in fp:
-                      skip = True
-                      print(f"[SKIP] {sf}")
-                      break
-              if not skip and fp.strip():
-                  filtered.append(fp)
-
-          with open('/tmp/susfs_filtered.patch', 'w') as f:
-              f.write('\n'.join(filtered))
-
-          print(f"\n[OK] Filtered patch: {len(filtered)} file sections kept")
-          PYEOF
-          
-          echo ""
-          echo "== Apply filtered patch (hanya kernel core files) =="
-          set +e
-          patch -p1 --fuzz=3 --no-backup-if-mismatch --force < /tmp/susfs_filtered.patch 2>&1 | tee /tmp/susfs_apply.log
-          set -e
-          
-          echo ""
-          echo "Succeed: $(grep -c 'succeeded' /tmp/susfs_apply.log)"
-          echo "FAILED : $(grep -c 'FAILED' /tmp/susfs_apply.log)"
-          
-          find . -name "*.rej" -not -path "./.susfs4ksu/*" -delete 2>/dev/null || true
-          find . -name "*.orig" -not -path "./.susfs4ksu/*" -delete 2>/dev/null || true
-
-      - name: Manual fix SUSFS hunks yang gagal (proven dari workflow ReSukiSU)
-        run: |
-          cd kernel-src
-          
-          if [ -f fs/proc_namespace.c ] && ! grep -q "susfs_def.h" fs/proc_namespace.c; then
-            sed -i '/#include "proc\/internal.h"/a\
-          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\
-          #include <linux/susfs_def.h>\
-          #endif' fs/proc_namespace.c
-          fi
-          
-          if [ -f fs/stat.c ] && ! grep -q "int err = inode->i_op->getattr" fs/stat.c; then
-            python3 << 'PYEOF'
-          import re
-          from pathlib import Path
-          p = Path("fs/stat.c")
-          text = p.read_text()
-          pattern = re.compile(
-              r'(\tif\s*\(inode->i_op->getattr\)\s*\n)'
-              r'(\t\treturn inode->i_op->getattr\(path->mnt,\s*path->dentry,\s*stat\);)',
-              re.MULTILINE
-          )
-          replacement = (r'\1'
-              '#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n\t{\n'
-              '\t\tint err = inode->i_op->getattr(path->mnt, path->dentry, stat);\n'
-              '\t\tif (!err)\n'
-              '\t\t\tsusfs_sus_kstat_spoof_generic_fillattr(inode, stat);\n'
-              '\t\treturn err;\n\t}\n#else\n' r'\2' '\n#endif')
-          new_text, n = pattern.subn(replacement, text)
-          if n > 0: p.write_text(new_text)
-          PYEOF
-          fi
-          
-          python3 << 'PYEOF'
-          from pathlib import Path
-          for filepath in ["fs/open.c", "fs/stat.c", "fs/proc_namespace.c", "fs/proc/task_mmu.c", "fs/proc/cmdline.c"]:
-              p = Path(filepath)
-              if not p.exists(): continue
-              lines = p.read_text().split('\n')
-              has_susfs = any('linux/susfs.h' in l for l in lines)
-              has_susfs_def = any('linux/susfs_def.h' in l for l in lines)
-              if has_susfs and has_susfs_def: continue
-              insert_idx = -1
-              for i, line in enumerate(lines):
-                  if line.strip().startswith('#include'):
-                      insert_idx = i; break
-              if insert_idx == -1: continue
-              new_includes = []
-              if not has_susfs: new_includes.append('#include <linux/susfs.h>')
-              if not has_susfs_def: new_includes.append('#include <linux/susfs_def.h>')
-              lines[insert_idx:insert_idx] = new_includes
-              p.write_text('\n'.join(lines))
-          PYEOF
-          
-          if [ -f fs/proc_namespace.c ] && ! grep -q "extern bool susfs_is_current_ksu_domain" fs/proc_namespace.c; then
-            python3 << 'PYEOF'
-          from pathlib import Path
-          p = Path("fs/proc_namespace.c")
-          lines = p.read_text().split('\n')
-          new_lines = []
-          inserted = False
-          for line in lines:
-              new_lines.append(line)
-              if not inserted and '#include "internal.h"' in line:
-                  new_lines.extend(['', '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT',
-                      'extern bool susfs_is_current_ksu_domain(void);',
-                      'extern bool susfs_hide_sus_mnts_for_non_su_procs;',
-                      '#endif', ''])
-                  inserted = True
-          p.write_text('\n'.join(new_lines))
-          PYEOF
-          fi
-          
-          if [ -f fs/stat.c ] && ! grep -q "extern void susfs_sus_kstat_spoof_generic_fillattr" fs/stat.c; then
-            python3 << 'PYEOF'
-          from pathlib import Path
-          p = Path("fs/stat.c")
-          lines = p.read_text().split('\n')
-          last_include = -1
-          for i, line in enumerate(lines):
-              if line.strip().startswith('#include'): last_include = i
-          if last_include >= 0:
-              lines[last_include+1:last_include+1] = ['', '#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT',
-                  'extern void susfs_sus_kstat_spoof_generic_fillattr(struct inode *inode, struct kstat *stat);',
-                  '#endif', '']
-              p.write_text('\n'.join(lines))
-          PYEOF
-          fi
-          
-          if [ -f fs/stat.c ] && grep -q "^EXPORT_SYMBOL(vfs_getattr_nosec);$" fs/stat.c; then
-            python3 << 'PYEOF'
-          from pathlib import Path
-          p = Path("fs/stat.c")
-          lines = p.read_text().split('\n')
-          new_lines = []
-          i = 0
-          removed = False
-          while i < len(lines):
-              line = lines[i]
-              new_lines.append(line)
-              if (not removed and line.strip() == 'EXPORT_SYMBOL(vfs_getattr_nosec);' and i + 3 < len(lines)):
-                  if (lines[i+1].strip() == '#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT'
-                      and 'susfs_sus_kstat_spoof_generic_fillattr' in lines[i+2].strip()
-                      and lines[i+3].strip() == '#endif'):
-                      i += 4; removed = True; continue
-              i += 1
-          if removed: p.write_text('\n'.join(new_lines))
-          PYEOF
+          # KUNCI FIX: copy file susfs ke kernel source SEBELUM menjalankan patch.
+          # patch -p1 tidak bisa membuat file baru dari nol — dia hanya memodifikasi file
+          # yang sudah ada. File susfs.c dan susfs.h harus di-copy manual terlebih dahulu.
+          # Referensi: https://github.com/KernelSU-Next/KernelSU-Next/issues/426
+          echo "== STEP 1: Copy file SUSFS ke kernel source =="
+          if [ -d "susfs4ksu-src/kernel_patches/fs" ]; then
+            cp -v susfs4ksu-src/kernel_patches/fs/* fs/
+            echo "[OK] File fs/ berhasil di-copy."
+          else
+            echo "[PERINGATAN] Folder kernel_patches/fs/ tidak ditemukan!"
           fi
 
-      - name: Prepare defconfig
+          if [ -d "susfs4ksu-src/kernel_patches/include/linux" ]; then
+            cp -v susfs4ksu-src/kernel_patches/include/linux/* include/linux/
+            echo "[OK] File include/linux/ berhasil di-copy."
+          else
+            echo "[PERINGATAN] Folder kernel_patches/include/linux/ tidak ditemukan!"
+          fi
+
+          # Verifikasi file kritis sudah ada
+          echo "== Verifikasi susfs.c dan susfs.h =="
+          ls -la fs/susfs.c include/linux/susfs.h 2>/dev/null || \
+            echo "[PERINGATAN] susfs.c atau susfs.h tidak ditemukan setelah copy!"
+
+          # STEP 2: Patch 1 — enable SUSFS di dalam folder KernelSU
+          echo "== STEP 2: Patch 1 ke KernelSU/ =="
+          PATCH1="susfs4ksu-src/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
+          if [ -f "$PATCH1" ]; then
+            cp "$PATCH1" KernelSU/
+            cd KernelSU
+            patch -p1 --forward < 10_enable_susfs_for_ksu.patch \
+              && echo "[OK] Patch 1 berhasil." \
+              || echo "[PERINGATAN] Patch 1 ada hunk yang gagal (mungkin sudah include)."
+            cd ..
+          else
+            echo "[INFO] Patch 1 tidak ditemukan, mungkin tidak dibutuhkan untuk versi ini."
+          fi
+
+          # STEP 3: Patch 2 — patch kernel source (memodifikasi file yang sudah ada)
+          # File baru (susfs.c, susfs.h) sudah di-copy di STEP 1, jadi patch ini
+          # hanya akan memodifikasi file existing (fs/proc_namespace.c, fs/open.c, dll)
+          echo "== STEP 3: Patch 2 ke kernel source =="
+          PATCH2=$(ls susfs4ksu-src/kernel_patches/50_add_susfs_in_kernel*.patch 2>/dev/null | head -1)
+          if [ -n "$PATCH2" ]; then
+            cp "$PATCH2" .
+            PATCH2_NAME=$(basename "$PATCH2")
+            echo "Menerapkan: $PATCH2_NAME"
+            patch -p1 --forward < "$PATCH2_NAME" \
+              && echo "[OK] Patch 2 berhasil sepenuhnya." \
+              || {
+                echo "[PERINGATAN] Patch 2 ada hunk yang gagal."
+                find . -name "*.rej" | head -10
+                for rej in $(find . -name "*.rej" 2>/dev/null | head -5); do
+                  echo "--- Isi $rej ---"
+                  cat "$rej"
+                done
+              }
+          else
+            echo "[PERINGATAN] File 50_add_susfs_in_kernel*.patch tidak ditemukan!"
+            echo "File yang ada di kernel_patches/:"
+            ls -la susfs4ksu-src/kernel_patches/
+          fi
+
+          # STEP 4: Verifikasi akhir
+          echo "== STEP 4: Verifikasi akhir =="
+          [ -f "fs/susfs.c" ] && echo "[OK] fs/susfs.c ada." || echo "[GAGAL] fs/susfs.c tidak ada!"
+          [ -f "include/linux/susfs.h" ] && echo "[OK] include/linux/susfs.h ada." || echo "[GAGAL] include/linux/susfs.h tidak ada!"
+          grep "susfs" fs/Makefile && echo "[OK] susfs ada di fs/Makefile" || echo "[PERINGATAN] susfs tidak ada di fs/Makefile"
+
+      - name: Siapkan defconfig
         run: |
           cd kernel-src
           DEFCONFIG_PATH="arch/arm64/configs/${{ github.event.inputs.defconfig }}"
 
-          if [ ! -f "$DEFCONFIG_PATH" ]; then
-            echo "ERROR: defconfig tidak ditemukan"
-            find arch/arm64/configs -iname "*845*" -o -iname "*beryllium*" 2>/dev/null
-            exit 1
+          EXTRACTED_CFG="$GITHUB_WORKSPACE/extracted-config/my_defconfig.txt"
+          if [ -f "$EXTRACTED_CFG" ]; then
+            echo "[INFO] Memakai config extract BaikalOS sebagai basis."
+            cp "$EXTRACTED_CFG" "$DEFCONFIG_PATH"
+          else
+            echo "[PERINGATAN] my_defconfig.txt tidak ditemukan, pakai defconfig asli source."
           fi
 
-          if [ "${{ github.event.inputs.use_extracted_config }}" = "true" ]; then
-            EXTRACTED_CFG="$GITHUB_WORKSPACE/extracted-config/my_defconfig.txt"
-            if [ -f "$EXTRACTED_CFG" ]; then
-              echo "[INFO] Pakai extracted config dari boot.img BaikalOS"
-              cp "$EXTRACTED_CFG" "$DEFCONFIG_PATH"
-            fi
-          fi
-
-          # Bersihkan entry KSU/SUSFS lama
-          sed -i '/^CONFIG_KSU/d;/^# CONFIG_KSU is not set/d' "$DEFCONFIG_PATH"
-          sed -i '/SUSFS/d' "$DEFCONFIG_PATH"
-
-          # Append config KSU + SUSFS (nama flag Andrey style)
+          # Config KSU-Next + SUSFS
+          # CATATAN PENTING: tidak pakai CONFIG_KPROBES untuk mode manual hook.
+          # KSU-Next v3.3.0-enjoy dengan SUSFS menggunakan manual hook untuk kompatibilitas SUSFS.
           {
-            echo ""
-            echo "# === KernelSU-Next ==="
             echo "CONFIG_KSU=y"
-            echo "CONFIG_KPROBES=y"
-            echo "CONFIG_KPROBE_EVENTS=y"
-            echo "CONFIG_KSU_KPROBES_HOOK=y"
-            echo ""
-            echo "# === SUSFS v2.1.0 (Andrey backport) ==="
             echo "CONFIG_KSU_SUSFS=y"
+            echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y"
             echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
             echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y"
             echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y"
             echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
+            echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y"
             echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
             echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
-            echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
-            echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
             echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
-            echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
-            echo ""
-            echo "# === Filesystem ==="
-            echo "CONFIG_OVERLAY_FS=y"
-            echo "CONFIG_TMPFS_XATTR=y"
           } >> "$DEFCONFIG_PATH"
+          echo "[OK] Defconfig dipatch dengan config KSU-Next + SUSFS."
 
-          echo ""
-          echo "== KSU + SUSFS config di defconfig =="
-          grep -E "CONFIG_KSU|SUSFS|OVERLAY" "$DEFCONFIG_PATH" | sort
-
-      - name: Patch arch/arm64/Makefile (fix clang vdso32 "-EL" assembler error)
+      - name: Patch arch/arm64/Makefile (fix clang vdso32)
         run: |
           cd kernel-src
           MAIN_MK="arch/arm64/Makefile"
-          [ -f "$MAIN_MK" ] || exit 1
-          sed -i -E 's@(CLANG_PREFIX32[[:space:]]*:=[[:space:]]*--prefix=\$\(GCC_TOOLCHAIN32_DIR\))[[:space:]]*$@\1$(notdir $(CROSS_COMPILE_ARM32))@' "$MAIN_MK" 2>/dev/null || true
+          cp "$MAIN_MK" "$MAIN_MK.orig"
+          sed -i -E \
+            's@(CLANG_PREFIX32[[:space:]]*:=[[:space:]]*--prefix=\$\(GCC_TOOLCHAIN32_DIR\))[[:space:]]*$@\1$(notdir $(CROSS_COMPILE_ARM32))@' \
+            "$MAIN_MK"
+          diff -q "$MAIN_MK" "$MAIN_MK.orig" > /dev/null \
+            && echo "[INFO] Patch vdso32 tidak diperlukan (sudah ada atau pattern beda)." \
+            || echo "[OK] Patch vdso32 berhasil."
+          rm -f "$MAIN_MK.orig"
 
       - name: Skip DTB yang tidak relevan/rusak
         run: |
           cd kernel-src
           DTS_MK="arch/arm64/boot/dts/qcom/Makefile"
-          [ -f "$DTS_MK" ] || exit 0
-          for dtb in sdm845-v2-qvr-evt.dtb sdm845-v2-qvr-dvt.dtb sdm845-interposer-sdm670-mtp.dtb sdm845-interposer-sdm670-cdp.dtb; do
-            sed -i "/$dtb/d" "$DTS_MK" 2>/dev/null || true
+          [ ! -f "$DTS_MK" ] && exit 0
+          for dtb in "sdm845-v2-qvr-evt.dtb" "sdm845-v2-qvr-dvt.dtb" \
+                     "sdm845-interposer-sdm670-mtp.dtb" "sdm845-interposer-sdm670-cdp.dtb"; do
+            grep -q "$dtb" "$DTS_MK" && sed -i "/$dtb/d" "$DTS_MK" && echo "[OK] $dtb dihapus."
           done
 
       - name: Compile Kernel
+        env:
+          KBUILD_BUILD_USER: "tan"
+          KBUILD_BUILD_HOST: "ardiansyah"
         run: |
           cd kernel-src
           OUT_DIR="out"
           export PATH="$HOME/clang-ext/bin:$PATH"
 
           MAKE_ARGS=(
-            O=$OUT_DIR
-            ARCH=arm64
-            CC=clang
-            LD=ld.lld
-            AR=llvm-ar
-            NM=llvm-nm
-            OBJCOPY=llvm-objcopy
-            OBJDUMP=llvm-objdump
-            STRIP=llvm-strip
-            READELF=llvm-readelf
+            O=$OUT_DIR ARCH=arm64
+            CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump
+            STRIP=llvm-strip READELF=llvm-readelf
             CLANG_TRIPLE=aarch64-linux-gnu-
             CROSS_COMPILE=aarch64-linux-gnu-
             CROSS_COMPILE_ARM32=arm-linux-gnueabi-
-            LLVM=1
-            LLVM_IAS=1
+            LLVM=1 LLVM_IAS=1
           )
 
           mkdir -p $OUT_DIR
           make "${MAKE_ARGS[@]}" ${{ github.event.inputs.defconfig }}
           make "${MAKE_ARGS[@]}" olddefconfig
 
-          echo "== Cek config KSU + SUSFS =="
-          for cfg in CONFIG_KSU CONFIG_KPROBES CONFIG_KPROBE_EVENTS CONFIG_KSU_KPROBES_HOOK CONFIG_KSU_SUSFS CONFIG_KSU_SUSFS_SUS_PATH CONFIG_KSU_SUSFS_SUS_MOUNT CONFIG_OVERLAY_FS; do
+          echo "== Cek config KSU/SUSFS di .config final =="
+          for cfg in CONFIG_KSU CONFIG_KSU_SUSFS; do
             grep "^${cfg}=" $OUT_DIR/.config || echo "PERINGATAN: ${cfg} tidak aktif!"
           done
 
@@ -425,47 +271,41 @@ jobs:
           BUILD_EXIT=${PIPESTATUS[0]}
           set -e
 
-          echo "== Exit code: $BUILD_EXIT =="
+          echo "== Exit code make: $BUILD_EXIT =="
+          IMAGE_OK=0; IMAGE_GZ_DTB_OK=0
+          [ -f "$OUT_DIR/arch/arm64/boot/Image" ] && { ls -la "$OUT_DIR/arch/arm64/boot/Image"; IMAGE_OK=1; }
+          [ -f "$OUT_DIR/arch/arm64/boot/Image.gz-dtb" ] && { ls -la "$OUT_DIR/arch/arm64/boot/Image.gz-dtb"; IMAGE_GZ_DTB_OK=1; }
+
           BUILD_OK=0
-          if [ -f "$OUT_DIR/arch/arm64/boot/Image.gz-dtb" ]; then
-            ls -la "$OUT_DIR/arch/arm64/boot/Image.gz-dtb"
-            BUILD_OK=1
-          elif [ -f "$OUT_DIR/arch/arm64/boot/Image" ]; then
-            ls -la "$OUT_DIR/arch/arm64/boot/Image"
-            BUILD_OK=1
-          fi
+          [ "$IMAGE_GZ_DTB_OK" -eq 1 ] && { echo "[OK] Image.gz-dtb berhasil!"; BUILD_OK=1; } || \
+          [ "$IMAGE_OK" -eq 1 ] && { echo "[SEBAGIAN OK] Image berhasil, Image.gz-dtb belum ada."; BUILD_OK=1; } || \
+          echo "[GAGAL] Build benar-benar gagal."
 
           echo "BUILD_OK=$BUILD_OK" >> "$GITHUB_ENV"
-          [ "$BUILD_OK" -eq 1 ] || exit 1
+          [ "$BUILD_OK" -ne 1 ] && exit 1 || true
 
       - name: Capture Build Metadata
         if: env.BUILD_OK == '1'
         run: |
           cd kernel-src
           KERNEL_COMMIT=$(git rev-parse --short HEAD)
+          KSU_COMMIT=$(cd KernelSU-Next && git rev-parse --short HEAD)
           KERNEL_VERSION_STRING=$(cat out/include/config/kernel.release 2>/dev/null || echo unknown)
-          BUILD_DATE=$(date -u '+%Y-%m-%d %H:%M UTC')
-          SUSFS_VERSION=$(grep "SUSFS_VERSION" include/linux/susfs.h 2>/dev/null | grep -oE '"[^"]+"' | tr -d '"' | head -1 || echo "unknown")
-          
           cat > ../build-metadata.json << JSONEOF
           {
-            "build_date": "${BUILD_DATE}",
-            "target_rom": "BaikalOS 13.0",
-            "device": "Poco F1 (beryllium)",
+            "build_date": "$(date -u '+%Y-%m-%d %H:%M UTC')",
             "kernel_source": "${{ github.event.inputs.kernel_source }}",
             "kernel_branch": "${{ github.event.inputs.kernel_branch }}",
             "kernel_commit": "${KERNEL_COMMIT}",
-            "kernel_version": "${KERNEL_VERSION_STRING}",
-            "ksu_source": "Andrey0800770/samsung_sdm845-kernel (ksu+susfs)",
-            "ksu_variant": "KernelSU-Next (pre-integrated by Andrey)",
-            "susfs_version": "${SUSFS_VERSION}",
-            "manager_apk": "KernelSU-Next official (https://t.me/ksunext_ci)",
-            "defconfig": "${{ github.event.inputs.defconfig }}",
+            "kernel_commit_full": "$(git rev-parse HEAD)",
+            "kernel_version_string": "${KERNEL_VERSION_STRING}",
+            "ksu_tag": "${{ github.event.inputs.ksu_tag }}",
+            "ksu_commit": "${KSU_COMMIT}",
+            "susfs_branch": "${{ github.event.inputs.susfs_branch }}",
             "zip_name": "${{ github.event.inputs.zip_name }}"
           }
           JSONEOF
-          
-          cat ../build-metadata.json | jq .
+          cat ../build-metadata.json
 
       - name: Upload Build Metadata
         if: env.BUILD_OK == '1'
@@ -473,13 +313,15 @@ jobs:
         with:
           name: build-metadata
           path: build-metadata.json
+          if-no-files-found: warn
 
-      - name: Upload Build Log
+      - name: Upload Build Log (selalu)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: build-log
           path: kernel-src/build.log
+          if-no-files-found: warn
 
       - name: Upload Image.gz-dtb
         uses: actions/upload-artifact@v4
@@ -494,3 +336,4 @@ jobs:
           name: ${{ github.event.inputs.zip_name }}-raw
           path: kernel-src/out/arch/arm64/boot/Image
           if-no-files-found: ignore
+menurutmu ?
