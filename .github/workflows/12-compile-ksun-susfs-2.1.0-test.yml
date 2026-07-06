@@ -1,4 +1,4 @@
-name: TEST4. Compile Kernel - BOS Beryllium + KSU-Next + SUSFS (Percobaan)
+name: 12. Compile Kernel - BOS Beryllium + KSU-Next + SUSFS (Percobaan)
 
 # Pola: BaikalOS 13.0 + KSU-Next (v3.3.0-enjoy dari ThRE-Team, terbukti compile di kernel 4.9)
 # + SUSFS kernel-4.9 dengan cara yang benar (copy file dulu, baru patch).
