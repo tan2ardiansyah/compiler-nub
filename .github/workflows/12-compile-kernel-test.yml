@@ -450,10 +450,63 @@ jobs:
           make "${MAKE_ARGS[@]}" ${{ github.event.inputs.defconfig }}
           make "${MAKE_ARGS[@]}" olddefconfig
 
-          echo "== Cek config KSU + SUSFS di .config hasil olddefconfig =="
+          # ============================================================
+          # FORCE ENABLE config KSU + SUSFS via scripts/config
+          # Ini bypass dependency check dari olddefconfig
+          # (olddefconfig kadang remove config kalau dependency tidak
+          # explicitly enabled, ini normal Kbuild behavior)
+          # ============================================================
+          echo "== Force enable KSU + SUSFS configs =="
+          
+          # Prerequisites untuk KSU + KPROBE
+          scripts/config --file $OUT_DIR/.config -e FTRACE
+          scripts/config --file $OUT_DIR/.config -e KPROBES
+          scripts/config --file $OUT_DIR/.config -e KPROBE_EVENTS
+          scripts/config --file $OUT_DIR/.config -e HAVE_KPROBES
+          
+          # KSU-Next
+          scripts/config --file $OUT_DIR/.config -e KSU
+          scripts/config --file $OUT_DIR/.config -e KSU_KPROBE_HOOKS
+          
+          # SUSFS
+          scripts/config --file $OUT_DIR/.config -e KSU_SUSFS
+          scripts/config --file $OUT_DIR/.config -e KSU_SUSFS_SUS_PATH
+          scripts/config --file $OUT_DIR/.config -e KSU_SUSFS_SUS_MOUNT
+          scripts/config --file $OUT_DIR/.config -e KSU_SUSFS_SUS_KSTAT
+          scripts/config --file $OUT_DIR/.config -e KSU_SUSFS_TRY_UMOUNT
+          scripts/config --file $OUT_DIR/.config -e KSU_SUSFS_SPOOF_UNAME
+          scripts/config --file $OUT_DIR/.config -e KSU_SUSFS_ENABLE_LOG
+          scripts/config --file $OUT_DIR/.config -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+          scripts/config --file $OUT_DIR/.config -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+          scripts/config --file $OUT_DIR/.config -e KSU_SUSFS_OPEN_REDIRECT
+          scripts/config --file $OUT_DIR/.config -e KSU_SUSFS_SUS_MAP
+          
+          # Filesystem
+          scripts/config --file $OUT_DIR/.config -e OVERLAY_FS
+          scripts/config --file $OUT_DIR/.config -e TMPFS_XATTR
+          
+          # Re-resolve dependencies (olddefconfig lagi supaya dependency benar)
+          make "${MAKE_ARGS[@]}" olddefconfig
+
+          echo ""
+          echo "== Cek config KSU + SUSFS FINAL setelah force enable =="
           for cfg in CONFIG_KSU CONFIG_KPROBES CONFIG_KPROBE_EVENTS CONFIG_KSU_KPROBE_HOOKS CONFIG_KSU_SUSFS CONFIG_KSU_SUSFS_SUS_PATH CONFIG_KSU_SUSFS_SUS_MOUNT CONFIG_OVERLAY_FS; do
-            grep "^${cfg}=" $OUT_DIR/.config || echo "PERINGATAN: ${cfg} tidak aktif di .config final!"
+            grep "^${cfg}=" $OUT_DIR/.config || echo "PERINGATAN: ${cfg} MASIH tidak aktif!"
           done
+          
+          # STOP kalau CONFIG_KSU_SUSFS masih missing (fatal)
+          if ! grep -q "^CONFIG_KSU_SUSFS=y" $OUT_DIR/.config; then
+            echo ""
+            echo "[FATAL] CONFIG_KSU_SUSFS tidak bisa di-enable!"
+            echo "Kemungkinan Kconfig SUSFS ada dependency yang tidak terpenuhi."
+            echo ""
+            echo "== Debug: cek Kconfig SUSFS =="
+            find . -name "Kconfig" -exec grep -l "SUSFS" {} \; 2>/dev/null | head -5
+            echo ""
+            echo "== Debug: cari dependency SUSFS =="
+            find . -name "Kconfig" -path "*/kernelsu/*" -exec grep -A 3 "config KSU_SUSFS$" {} \; 2>/dev/null
+            exit 1
+          fi
 
           # -k (keep going): jangan berhenti total kalau satu target dtb gagal
           # (misal dtb reference board Qualcomm yang tidak relevan untuk beryllium, contoh: sdm845-v2-qvr-evt.dtb).
