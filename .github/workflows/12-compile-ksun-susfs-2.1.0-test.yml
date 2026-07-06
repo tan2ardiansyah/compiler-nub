@@ -92,40 +92,24 @@ jobs:
           cd kernel-src
           git log -1 --oneline
 
-      - name: Import KSU-Next + SUSFS dari Andrey
+      - name: Import KSU-Next + SUSFS (hybrid Andrey + JackA1ltman)
         run: |
           cd kernel-src
           
-          echo "== Clone Andrey source =="
+          echo "== Clone Andrey source (untuk KSU-Next driver + SUSFS source) =="
           git clone --depth=1 \
             -b "${{ github.event.inputs.andrey_ksu_branch }}" \
             "${{ github.event.inputs.andrey_ksu_repo }}" \
             /tmp/andrey-src
           
           echo ""
-          echo "== Copy drivers/kernelsu/ (KSU-Next + SUSFS Kconfig) =="
+          echo "== Copy drivers/kernelsu/ dari Andrey (KSU-Next + SUSFS Kconfig) =="
           cp -r /tmp/andrey-src/drivers/kernelsu drivers/
           echo "[OK] drivers/kernelsu imported"
           
           echo ""
-          echo "== Copy SUSFS source files =="
+          echo "== Copy SUSFS source files dari Andrey =="
           for f in fs/susfs.c fs/sus_su.c include/linux/susfs.h include/linux/susfs_def.h; do
-            if [ -f "/tmp/andrey-src/$f" ]; then
-              cp "/tmp/andrey-src/$f" "$f"
-              echo "[OK] Copied $f"
-            fi
-          done
-          
-          echo ""
-          echo "== Copy modified kernel files dari Andrey (SUSFS integration) =="
-          for f in fs/Makefile \
-                   fs/namei.c fs/namespace.c fs/open.c fs/stat.c fs/readdir.c \
-                   fs/statfs.c fs/proc_namespace.c \
-                   fs/proc/base.c fs/proc/fd.c fs/proc/task_mmu.c fs/proc/cmdline.c \
-                   fs/notify/fdinfo.c \
-                   mm/memory.c \
-                   security/selinux/avc.c \
-                   kernel/kallsyms.c kernel/sys.c; do
             if [ -f "/tmp/andrey-src/$f" ]; then
               cp "/tmp/andrey-src/$f" "$f"
               echo "[OK] Copied $f"
@@ -138,26 +122,200 @@ jobs:
             echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
             echo "[OK] Added kernelsu to drivers/Makefile"
           fi
-          
           if ! grep -q "kernelsu" drivers/Kconfig; then
             sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
             echo "[OK] Added kernelsu to drivers/Kconfig"
           fi
           
           echo ""
-          echo "== Verify SUSFS version =="
+          echo "== Add susfs.o + sus_su.o ke fs/Makefile =="
+          if ! grep -q "susfs.o" fs/Makefile; then
+            sed -i '0,/^obj-y[[:space:]]*+=/{s|^obj-y[[:space:]]*+=.*|&\nobj-y += susfs.o sus_su.o|}' fs/Makefile
+            echo "[OK] Added susfs.o sus_su.o to fs/Makefile"
+          fi
+          
+          echo ""
+          echo "== Verify =="
           grep "SUSFS_VERSION" include/linux/susfs.h | head -3
-          
-          echo ""
-          echo "== Verify Kconfig SUSFS =="
           grep "config KSU_SUSFS" drivers/kernelsu/Kconfig | head -5
-          
-          echo ""
-          echo "== Verify fs/Makefile punya susfs.o =="
           grep "susfs" fs/Makefile | head -5
           
-          # Cleanup
           rm -rf /tmp/andrey-src
+
+      # ============================================================
+      # Apply SUSFS kernel patches dari JackA1ltman (untuk BaikalOS)
+      # File kernel core BaikalOS berbeda dari Samsung, jadi pakai
+      # patch JackA1ltman yang sudah proven match di BaikalOS
+      # ============================================================
+      - name: Apply SUSFS kernel patches (JackA1ltman untuk BaikalOS)
+        run: |
+          cd kernel-src
+          
+          echo "== Download SUSFS patch =="
+          curl -LSsf "https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/Patch/susfs_patch_to_4.9.patch" -o /tmp/susfs.patch
+          
+          echo ""
+          echo "== Filter patch: SKIP file yang sudah di-copy dari Andrey =="
+          # Bikin patch yang SKIP fs/susfs.c, include/linux/susfs.h, dll
+          # Karena file itu sudah ada (dari Andrey v2.1.0)
+          # Hanya apply patch ke kernel core files (fs/namei.c, fs/stat.c, dll)
+          python3 << 'PYEOF'
+          import re
+
+          with open('/tmp/susfs.patch', 'r') as f:
+              patch_content = f.read()
+
+          # File yang HARUS SKIP (sudah di-copy dari Andrey)
+          skip_files = [
+              'fs/susfs.c',
+              'fs/sus_su.c',
+              'include/linux/susfs.h',
+              'include/linux/susfs_def.h',
+              'fs/Makefile',        # sudah kita modify manual
+          ]
+
+          # Split patch per-file
+          file_patches = re.split(r'(?=^diff --git)', patch_content, flags=re.MULTILINE)
+          
+          filtered = []
+          for fp in file_patches:
+              skip = False
+              for sf in skip_files:
+                  if sf in fp:
+                      skip = True
+                      print(f"[SKIP] {sf}")
+                      break
+              if not skip and fp.strip():
+                  filtered.append(fp)
+
+          with open('/tmp/susfs_filtered.patch', 'w') as f:
+              f.write('\n'.join(filtered))
+
+          print(f"\n[OK] Filtered patch: {len(filtered)} file sections kept")
+          PYEOF
+          
+          echo ""
+          echo "== Apply filtered patch (hanya kernel core files) =="
+          set +e
+          patch -p1 --fuzz=3 --no-backup-if-mismatch --force < /tmp/susfs_filtered.patch 2>&1 | tee /tmp/susfs_apply.log
+          set -e
+          
+          echo ""
+          echo "Succeed: $(grep -c 'succeeded' /tmp/susfs_apply.log)"
+          echo "FAILED : $(grep -c 'FAILED' /tmp/susfs_apply.log)"
+          
+          find . -name "*.rej" -not -path "./.susfs4ksu/*" -delete 2>/dev/null || true
+          find . -name "*.orig" -not -path "./.susfs4ksu/*" -delete 2>/dev/null || true
+
+      - name: Manual fix SUSFS hunks yang gagal (proven dari workflow ReSukiSU)
+        run: |
+          cd kernel-src
+          
+          if [ -f fs/proc_namespace.c ] && ! grep -q "susfs_def.h" fs/proc_namespace.c; then
+            sed -i '/#include "proc\/internal.h"/a\
+          #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\
+          #include <linux/susfs_def.h>\
+          #endif' fs/proc_namespace.c
+          fi
+          
+          if [ -f fs/stat.c ] && ! grep -q "int err = inode->i_op->getattr" fs/stat.c; then
+            python3 << 'PYEOF'
+          import re
+          from pathlib import Path
+          p = Path("fs/stat.c")
+          text = p.read_text()
+          pattern = re.compile(
+              r'(\tif\s*\(inode->i_op->getattr\)\s*\n)'
+              r'(\t\treturn inode->i_op->getattr\(path->mnt,\s*path->dentry,\s*stat\);)',
+              re.MULTILINE
+          )
+          replacement = (r'\1'
+              '#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n\t{\n'
+              '\t\tint err = inode->i_op->getattr(path->mnt, path->dentry, stat);\n'
+              '\t\tif (!err)\n'
+              '\t\t\tsusfs_sus_kstat_spoof_generic_fillattr(inode, stat);\n'
+              '\t\treturn err;\n\t}\n#else\n' r'\2' '\n#endif')
+          new_text, n = pattern.subn(replacement, text)
+          if n > 0: p.write_text(new_text)
+          PYEOF
+          fi
+          
+          python3 << 'PYEOF'
+          from pathlib import Path
+          for filepath in ["fs/open.c", "fs/stat.c", "fs/proc_namespace.c", "fs/proc/task_mmu.c", "fs/proc/cmdline.c"]:
+              p = Path(filepath)
+              if not p.exists(): continue
+              lines = p.read_text().split('\n')
+              has_susfs = any('linux/susfs.h' in l for l in lines)
+              has_susfs_def = any('linux/susfs_def.h' in l for l in lines)
+              if has_susfs and has_susfs_def: continue
+              insert_idx = -1
+              for i, line in enumerate(lines):
+                  if line.strip().startswith('#include'):
+                      insert_idx = i; break
+              if insert_idx == -1: continue
+              new_includes = []
+              if not has_susfs: new_includes.append('#include <linux/susfs.h>')
+              if not has_susfs_def: new_includes.append('#include <linux/susfs_def.h>')
+              lines[insert_idx:insert_idx] = new_includes
+              p.write_text('\n'.join(lines))
+          PYEOF
+          
+          if [ -f fs/proc_namespace.c ] && ! grep -q "extern bool susfs_is_current_ksu_domain" fs/proc_namespace.c; then
+            python3 << 'PYEOF'
+          from pathlib import Path
+          p = Path("fs/proc_namespace.c")
+          lines = p.read_text().split('\n')
+          new_lines = []
+          inserted = False
+          for line in lines:
+              new_lines.append(line)
+              if not inserted and '#include "internal.h"' in line:
+                  new_lines.extend(['', '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT',
+                      'extern bool susfs_is_current_ksu_domain(void);',
+                      'extern bool susfs_hide_sus_mnts_for_non_su_procs;',
+                      '#endif', ''])
+                  inserted = True
+          p.write_text('\n'.join(new_lines))
+          PYEOF
+          fi
+          
+          if [ -f fs/stat.c ] && ! grep -q "extern void susfs_sus_kstat_spoof_generic_fillattr" fs/stat.c; then
+            python3 << 'PYEOF'
+          from pathlib import Path
+          p = Path("fs/stat.c")
+          lines = p.read_text().split('\n')
+          last_include = -1
+          for i, line in enumerate(lines):
+              if line.strip().startswith('#include'): last_include = i
+          if last_include >= 0:
+              lines[last_include+1:last_include+1] = ['', '#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT',
+                  'extern void susfs_sus_kstat_spoof_generic_fillattr(struct inode *inode, struct kstat *stat);',
+                  '#endif', '']
+              p.write_text('\n'.join(lines))
+          PYEOF
+          fi
+          
+          if [ -f fs/stat.c ] && grep -q "^EXPORT_SYMBOL(vfs_getattr_nosec);$" fs/stat.c; then
+            python3 << 'PYEOF'
+          from pathlib import Path
+          p = Path("fs/stat.c")
+          lines = p.read_text().split('\n')
+          new_lines = []
+          i = 0
+          removed = False
+          while i < len(lines):
+              line = lines[i]
+              new_lines.append(line)
+              if (not removed and line.strip() == 'EXPORT_SYMBOL(vfs_getattr_nosec);' and i + 3 < len(lines)):
+                  if (lines[i+1].strip() == '#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT'
+                      and 'susfs_sus_kstat_spoof_generic_fillattr' in lines[i+2].strip()
+                      and lines[i+3].strip() == '#endif'):
+                      i += 4; removed = True; continue
+              i += 1
+          if removed: p.write_text('\n'.join(new_lines))
+          PYEOF
+          fi
 
       - name: Prepare defconfig
         run: |
