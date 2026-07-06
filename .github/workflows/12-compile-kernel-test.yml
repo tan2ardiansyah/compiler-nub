@@ -52,6 +52,7 @@ jobs:
   test-build:
     name: ${{ github.event.inputs.zip_name }}
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - name: Checkout repo (untuk akses extracted-config/my_defconfig.txt)
         uses: actions/checkout@v4
