@@ -26,7 +26,7 @@ on:
       ksu_tag:
         description: 'KernelSU-Next tag/commit'
         required: false
-        default: 'v3.2.0'
+        default: 'v3.3.0-enjoy'
       clang_url:
         description: 'Clang prebuilt'
         required: false
@@ -214,8 +214,8 @@ jobs:
 
       - name: Compile Kernel (test build, tidak untuk flash)
         env:
-          KBUILD_BUILD_USER: "tester"
-          KBUILD_BUILD_HOST: "ghactions"
+          KBUILD_BUILD_USER: "Nerf."
+          KBUILD_BUILD_HOST: "OldlineSSS"
         run: |
           cd kernel-src
           OUT_DIR="out"
