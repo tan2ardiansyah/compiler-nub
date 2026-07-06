@@ -1,4 +1,4 @@
-name: 1. Compile Kernel - BOS Beryllium + KSU-Next + SUSFS + Log
+name: 12. Compile Kernel - BOS Beryllium + KSU-Next + SUSFS + Log
 
 on:
   workflow_dispatch:
