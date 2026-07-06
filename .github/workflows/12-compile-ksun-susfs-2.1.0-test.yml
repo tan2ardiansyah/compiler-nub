@@ -1,0 +1,325 @@
+name: 12. Compile Kernel - BOS Beryllium + KSU-Next + SUSFS v2.1.0
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_name:
+        description: 'Nama Build'
+        required: true
+        default: 'bos-beryllium-ksunext-susfs'
+      kernel_source:
+        description: 'Kernel Source (BaikalOS)'
+        required: true
+        default: 'https://github.com/baikalos/android_kernel_xiaomi_sdm845.git'
+      kernel_branch:
+        description: 'Kernel Branch'
+        required: true
+        default: '13.0'
+      defconfig:
+        description: 'defconfig path'
+        required: true
+        default: 'vendor/xiaomi/mi845_defconfig'
+      use_extracted_config:
+        description: 'Pakai extracted config dari boot.img BaikalOS? (true/false)'
+        required: true
+        default: 'true'
+      andrey_ksu_repo:
+        description: 'Andrey repo (KSU-Next + SUSFS v2.1.0 pre-integrated)'
+        required: true
+        default: 'https://github.com/Andrey0800770/samsung_sdm845-kernel.git'
+      andrey_ksu_branch:
+        description: 'Andrey branch'
+        required: true
+        default: 'ksu+susfs'
+      clang_url:
+        description: 'Clang prebuilt'
+        required: false
+        default: 'https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-release/clang-r487747c.tar.gz'
+
+jobs:
+  test-build:
+    name: ${{ github.event.inputs.zip_name }}
+    runs-on: ubuntu-latest
+    env:
+      KBUILD_BUILD_USER: "Nerf."
+      KBUILD_BUILD_HOST: "OldlineSSS"
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Show Input
+        run: |
+          echo "kernel_source: ${{ github.event.inputs.kernel_source }}"
+          echo "kernel_branch: ${{ github.event.inputs.kernel_branch }}"
+          echo "defconfig: ${{ github.event.inputs.defconfig }}"
+          echo "use_extracted_config: ${{ github.event.inputs.use_extracted_config }}"
+          echo "andrey_ksu_repo: ${{ github.event.inputs.andrey_ksu_repo }}"
+          echo "andrey_ksu_branch: ${{ github.event.inputs.andrey_ksu_branch }}"
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc build-essential flex bison ca-certificates clang lld llvm \
+            libssl-dev libelf-dev cpio curl git unzip wget \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            g++-aarch64-linux-gnu g++-arm-linux-gnueabi \
+            binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
+            libncurses5-dev libncursesw5-dev python3 python-is-python3 patch jq
+
+      - name: Setup Clang Cache
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/clang-ext
+          key: clang-${{ github.event.inputs.clang_url }}
+
+      - name: Setup Clang
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/clang-ext
+          curl -Lo clang.tar.gz "${{ github.event.inputs.clang_url }}"
+          tar -xzf clang.tar.gz -C ~/clang-ext
+          rm -f clang.tar.gz
+
+      - name: Add Clang to PATH
+        run: echo "$HOME/clang-ext/bin" >> $GITHUB_PATH
+
+      - name: Clone BaikalOS kernel source
+        run: |
+          git clone --depth=1 "${{ github.event.inputs.kernel_source }}" \
+            -b "${{ github.event.inputs.kernel_branch }}" kernel-src
+          cd kernel-src
+          git log -1 --oneline
+
+      - name: Import KSU-Next + SUSFS dari Andrey
+        run: |
+          cd kernel-src
+          
+          echo "== Clone Andrey source =="
+          git clone --depth=1 \
+            -b "${{ github.event.inputs.andrey_ksu_branch }}" \
+            "${{ github.event.inputs.andrey_ksu_repo }}" \
+            /tmp/andrey-src
+          
+          echo ""
+          echo "== Copy drivers/kernelsu/ dari Andrey (KSU-Next + SUSFS v2.1.0) =="
+          cp -r /tmp/andrey-src/drivers/kernelsu drivers/
+          echo "[OK] drivers/kernelsu imported"
+          
+          echo ""
+          echo "== Copy file SUSFS ke fs/ dan include/linux/ =="
+          for f in fs/susfs.c fs/sus_su.c; do
+            if [ -f "/tmp/andrey-src/$f" ]; then
+              cp "/tmp/andrey-src/$f" "$f"
+              echo "[OK] Copied $f"
+            fi
+          done
+          
+          for f in include/linux/susfs.h include/linux/susfs_def.h; do
+            if [ -f "/tmp/andrey-src/$f" ]; then
+              cp "/tmp/andrey-src/$f" "$f"
+              echo "[OK] Copied $f"
+            fi
+          done
+          
+          echo ""
+          echo "== Register drivers/kernelsu ke Makefile + Kconfig =="
+          if ! grep -q "kernelsu" drivers/Makefile; then
+            echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+            echo "[OK] Added kernelsu to drivers/Makefile"
+          fi
+          
+          if ! grep -q "kernelsu" drivers/Kconfig; then
+            sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+            echo "[OK] Added kernelsu source to drivers/Kconfig"
+          fi
+          
+          echo ""
+          echo "== Verify SUSFS version =="
+          grep "SUSFS_VERSION" include/linux/susfs.h | head -3
+          
+          echo ""
+          echo "== Verify Kconfig SUSFS =="
+          grep "config KSU_SUSFS" drivers/kernelsu/Kconfig | head -5
+          
+          # Cleanup
+          rm -rf /tmp/andrey-src
+
+      - name: Prepare defconfig
+        run: |
+          cd kernel-src
+          DEFCONFIG_PATH="arch/arm64/configs/${{ github.event.inputs.defconfig }}"
+
+          if [ ! -f "$DEFCONFIG_PATH" ]; then
+            echo "ERROR: defconfig tidak ditemukan"
+            find arch/arm64/configs -iname "*845*" -o -iname "*beryllium*" 2>/dev/null
+            exit 1
+          fi
+
+          if [ "${{ github.event.inputs.use_extracted_config }}" = "true" ]; then
+            EXTRACTED_CFG="$GITHUB_WORKSPACE/extracted-config/my_defconfig.txt"
+            if [ -f "$EXTRACTED_CFG" ]; then
+              echo "[INFO] Pakai extracted config dari boot.img BaikalOS"
+              cp "$EXTRACTED_CFG" "$DEFCONFIG_PATH"
+            fi
+          fi
+
+          # Bersihkan entry KSU/SUSFS lama
+          sed -i '/^CONFIG_KSU/d;/^# CONFIG_KSU is not set/d' "$DEFCONFIG_PATH"
+          sed -i '/SUSFS/d' "$DEFCONFIG_PATH"
+
+          # Append config KSU + SUSFS (nama flag Andrey style)
+          {
+            echo ""
+            echo "# === KernelSU-Next ==="
+            echo "CONFIG_KSU=y"
+            echo "CONFIG_KPROBES=y"
+            echo "CONFIG_KPROBE_EVENTS=y"
+            echo "CONFIG_KSU_KPROBES_HOOK=y"
+            echo ""
+            echo "# === SUSFS v2.1.0 (Andrey backport) ==="
+            echo "CONFIG_KSU_SUSFS=y"
+            echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
+            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+            echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
+            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
+            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
+            echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
+            echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
+            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
+            echo ""
+            echo "# === Filesystem ==="
+            echo "CONFIG_OVERLAY_FS=y"
+            echo "CONFIG_TMPFS_XATTR=y"
+          } >> "$DEFCONFIG_PATH"
+
+          echo ""
+          echo "== KSU + SUSFS config di defconfig =="
+          grep -E "CONFIG_KSU|SUSFS|OVERLAY" "$DEFCONFIG_PATH" | sort
+
+      - name: Patch arch/arm64/Makefile (fix clang vdso32 "-EL" assembler error)
+        run: |
+          cd kernel-src
+          MAIN_MK="arch/arm64/Makefile"
+          [ -f "$MAIN_MK" ] || exit 1
+          sed -i -E 's@(CLANG_PREFIX32[[:space:]]*:=[[:space:]]*--prefix=\$\(GCC_TOOLCHAIN32_DIR\))[[:space:]]*$@\1$(notdir $(CROSS_COMPILE_ARM32))@' "$MAIN_MK" 2>/dev/null || true
+
+      - name: Skip DTB yang tidak relevan/rusak
+        run: |
+          cd kernel-src
+          DTS_MK="arch/arm64/boot/dts/qcom/Makefile"
+          [ -f "$DTS_MK" ] || exit 0
+          for dtb in sdm845-v2-qvr-evt.dtb sdm845-v2-qvr-dvt.dtb sdm845-interposer-sdm670-mtp.dtb sdm845-interposer-sdm670-cdp.dtb; do
+            sed -i "/$dtb/d" "$DTS_MK" 2>/dev/null || true
+          done
+
+      - name: Compile Kernel
+        run: |
+          cd kernel-src
+          OUT_DIR="out"
+          export PATH="$HOME/clang-ext/bin:$PATH"
+
+          MAKE_ARGS=(
+            O=$OUT_DIR
+            ARCH=arm64
+            CC=clang
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+            READELF=llvm-readelf
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            LLVM=1
+            LLVM_IAS=1
+          )
+
+          mkdir -p $OUT_DIR
+          make "${MAKE_ARGS[@]}" ${{ github.event.inputs.defconfig }}
+          make "${MAKE_ARGS[@]}" olddefconfig
+
+          echo "== Cek config KSU + SUSFS =="
+          for cfg in CONFIG_KSU CONFIG_KPROBES CONFIG_KPROBE_EVENTS CONFIG_KSU_KPROBES_HOOK CONFIG_KSU_SUSFS CONFIG_KSU_SUSFS_SUS_PATH CONFIG_KSU_SUSFS_SUS_MOUNT CONFIG_OVERLAY_FS; do
+            grep "^${cfg}=" $OUT_DIR/.config || echo "PERINGATAN: ${cfg} tidak aktif!"
+          done
+
+          set +e
+          make -k -j$(nproc --all) "${MAKE_ARGS[@]}" 2>&1 | tee build.log
+          BUILD_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          echo "== Exit code: $BUILD_EXIT =="
+          BUILD_OK=0
+          if [ -f "$OUT_DIR/arch/arm64/boot/Image.gz-dtb" ]; then
+            ls -la "$OUT_DIR/arch/arm64/boot/Image.gz-dtb"
+            BUILD_OK=1
+          elif [ -f "$OUT_DIR/arch/arm64/boot/Image" ]; then
+            ls -la "$OUT_DIR/arch/arm64/boot/Image"
+            BUILD_OK=1
+          fi
+
+          echo "BUILD_OK=$BUILD_OK" >> "$GITHUB_ENV"
+          [ "$BUILD_OK" -eq 1 ] || exit 1
+
+      - name: Capture Build Metadata
+        if: env.BUILD_OK == '1'
+        run: |
+          cd kernel-src
+          KERNEL_COMMIT=$(git rev-parse --short HEAD)
+          KERNEL_VERSION_STRING=$(cat out/include/config/kernel.release 2>/dev/null || echo unknown)
+          BUILD_DATE=$(date -u '+%Y-%m-%d %H:%M UTC')
+          SUSFS_VERSION=$(grep "SUSFS_VERSION" include/linux/susfs.h 2>/dev/null | grep -oE '"[^"]+"' | tr -d '"' | head -1 || echo "unknown")
+          
+          cat > ../build-metadata.json << JSONEOF
+          {
+            "build_date": "${BUILD_DATE}",
+            "target_rom": "BaikalOS 13.0",
+            "device": "Poco F1 (beryllium)",
+            "kernel_source": "${{ github.event.inputs.kernel_source }}",
+            "kernel_branch": "${{ github.event.inputs.kernel_branch }}",
+            "kernel_commit": "${KERNEL_COMMIT}",
+            "kernel_version": "${KERNEL_VERSION_STRING}",
+            "ksu_source": "Andrey0800770/samsung_sdm845-kernel (ksu+susfs)",
+            "ksu_variant": "KernelSU-Next (pre-integrated by Andrey)",
+            "susfs_version": "${SUSFS_VERSION}",
+            "manager_apk": "KernelSU-Next official (https://t.me/ksunext_ci)",
+            "defconfig": "${{ github.event.inputs.defconfig }}",
+            "zip_name": "${{ github.event.inputs.zip_name }}"
+          }
+          JSONEOF
+          
+          cat ../build-metadata.json | jq .
+
+      - name: Upload Build Metadata
+        if: env.BUILD_OK == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-metadata
+          path: build-metadata.json
+
+      - name: Upload Build Log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: kernel-src/build.log
+
+      - name: Upload Image.gz-dtb
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.zip_name }}-gz-dtb
+          path: kernel-src/out/arch/arm64/boot/Image.gz-dtb
+          if-no-files-found: ignore
+
+      - name: Upload Image Only
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.zip_name }}-raw
+          path: kernel-src/out/arch/arm64/boot/Image
+          if-no-files-found: ignore
