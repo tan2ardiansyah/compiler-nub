@@ -103,20 +103,29 @@ jobs:
             /tmp/andrey-src
           
           echo ""
-          echo "== Copy drivers/kernelsu/ dari Andrey (KSU-Next + SUSFS v2.1.0) =="
+          echo "== Copy drivers/kernelsu/ (KSU-Next + SUSFS Kconfig) =="
           cp -r /tmp/andrey-src/drivers/kernelsu drivers/
           echo "[OK] drivers/kernelsu imported"
           
           echo ""
-          echo "== Copy file SUSFS ke fs/ dan include/linux/ =="
-          for f in fs/susfs.c fs/sus_su.c; do
+          echo "== Copy SUSFS source files =="
+          for f in fs/susfs.c fs/sus_su.c include/linux/susfs.h include/linux/susfs_def.h; do
             if [ -f "/tmp/andrey-src/$f" ]; then
               cp "/tmp/andrey-src/$f" "$f"
               echo "[OK] Copied $f"
             fi
           done
           
-          for f in include/linux/susfs.h include/linux/susfs_def.h; do
+          echo ""
+          echo "== Copy modified kernel files dari Andrey (SUSFS integration) =="
+          for f in fs/Makefile \
+                   fs/namei.c fs/namespace.c fs/open.c fs/stat.c fs/readdir.c \
+                   fs/statfs.c fs/proc_namespace.c \
+                   fs/proc/base.c fs/proc/fd.c fs/proc/task_mmu.c fs/proc/cmdline.c \
+                   fs/notify/fdinfo.c \
+                   mm/memory.c \
+                   security/selinux/avc.c \
+                   kernel/kallsyms.c kernel/sys.c; do
             if [ -f "/tmp/andrey-src/$f" ]; then
               cp "/tmp/andrey-src/$f" "$f"
               echo "[OK] Copied $f"
@@ -132,7 +141,7 @@ jobs:
           
           if ! grep -q "kernelsu" drivers/Kconfig; then
             sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
-            echo "[OK] Added kernelsu source to drivers/Kconfig"
+            echo "[OK] Added kernelsu to drivers/Kconfig"
           fi
           
           echo ""
@@ -142,6 +151,10 @@ jobs:
           echo ""
           echo "== Verify Kconfig SUSFS =="
           grep "config KSU_SUSFS" drivers/kernelsu/Kconfig | head -5
+          
+          echo ""
+          echo "== Verify fs/Makefile punya susfs.o =="
+          grep "susfs" fs/Makefile | head -5
           
           # Cleanup
           rm -rf /tmp/andrey-src
