@@ -1,0 +1,420 @@
+name: 13. Compile Kernel - BOS Beryllium + KSU-Next + SUSFS
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_name:
+        description: 'Nama Build'
+        required: true
+        default: 'bos-beryllium-ksunext-susfs'
+      kernel_source:
+        description: 'Kernel Source'
+        required: true
+        default: 'https://github.com/baikalos/android_kernel_xiaomi_sdm845.git'
+      kernel_branch:
+        description: 'Kernel Branch'
+        required: true
+        default: '13.0'
+      defconfig:
+        description: 'defconfig path'
+        required: true
+        default: 'vendor/xiaomi/mi845_defconfig'
+      use_extracted_config:
+        description: 'Pakai extracted config? (true/false)'
+        required: true
+        default: 'true'
+      ksu_tag:
+        description: 'KernelSU-Next tag'
+        required: false
+        default: 'v3.3.0-enjoy'
+      susfs_branch:
+        description: 'SUSFS branch'
+        required: false
+        default: 'kernel-4.9'
+
+jobs:
+  build:
+    name: ${{ github.event.inputs.zip_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      KBUILD_BUILD_USER: "Nerf."
+      KBUILD_BUILD_HOST: "OldlineSSS"
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc build-essential flex bison ca-certificates \
+            libssl-dev libelf-dev cpio curl git unzip wget patch \
+            python3 python-is-python3 jq \
+            libncurses5-dev libncursesw5-dev
+
+      # ============================================================
+      # TOOLCHAIN: Clang r353983c + GCC 4.9 (era kernel 4.9, proven)
+      # Mirror approach ravindu644/ciroprogamer
+      # ============================================================
+      - name: Setup Clang r353983c (Android 10 era, kernel 4.9 compatible)
+        run: |
+          mkdir -p ~/toolchains/clang
+          echo "== Download Clang r353983c =="
+          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android10-release/clang-r353983c.tar.gz -O /tmp/clang.tar.gz
+          
+          FILE_SIZE=$(stat -c%s /tmp/clang.tar.gz)
+          echo "Downloaded: $FILE_SIZE bytes"
+          
+          if [ "$FILE_SIZE" -lt 10000000 ]; then
+            echo "[FATAL] Clang download gagal (file terlalu kecil)"
+            echo "Coba URL alternatif..."
+            wget -q "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-10.0.0_r1/clang-r353983c.tar.gz" -O /tmp/clang.tar.gz
+            FILE_SIZE=$(stat -c%s /tmp/clang.tar.gz)
+            echo "Alt downloaded: $FILE_SIZE bytes"
+            [ "$FILE_SIZE" -lt 10000000 ] && { echo "[FATAL] Semua URL gagal"; exit 1; }
+          fi
+          
+          tar -xzf /tmp/clang.tar.gz -C ~/toolchains/clang
+          rm /tmp/clang.tar.gz
+          ~/toolchains/clang/bin/clang --version | head -3
+
+      - name: Setup GCC 4.9 aarch64 (cross-compiler arm64)
+        run: |
+          echo "== Clone GCC 4.9 aarch64 =="
+          git clone --depth=1 \
+            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 \
+            -b android-9.0.0_r61 \
+            ~/toolchains/gcc-aarch64
+
+      - name: Setup GCC 4.9 arm32 (cross-compiler arm, untuk vDSO32)
+        run: |
+          echo "== Clone GCC 4.9 arm32 =="
+          git clone --depth=1 \
+            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9 \
+            -b android-9.0.0_r61 \
+            ~/toolchains/gcc-arm32
+
+      - name: Clone BaikalOS kernel source
+        run: |
+          git clone --depth=1 "${{ github.event.inputs.kernel_source }}" \
+            -b "${{ github.event.inputs.kernel_branch }}" kernel-src
+          cd kernel-src
+          git log -1 --oneline
+
+      - name: Setup KernelSU-Next (ThRE-Team)
+        run: |
+          cd kernel-src
+          curl -LSs "https://raw.githubusercontent.com/ThRE-Team/KernelSU-Next/main/kernel/setup.sh" \
+            | bash -s "${{ github.event.inputs.ksu_tag }}"
+          
+          echo "== Verify KSU-Next =="
+          ls -la drivers/kernelsu || echo "MISSING!"
+          
+          # Detect folder name
+          KSU_DIR=""
+          for d in KernelSU-Next KernelSU kernelsu; do
+            [ -d "$d" ] && { KSU_DIR="$d"; break; }
+          done
+          echo "KSU_DIR=$KSU_DIR" >> "$GITHUB_ENV"
+          echo "KSU folder: $KSU_DIR"
+
+      # ============================================================
+      # SUSFS: Copy files + apply patches dari simonpunk
+      # Approach: copy dulu, baru patch (referensi issue #426)
+      # ============================================================
+      - name: Setup SUSFS (copy files + patch)
+        run: |
+          cd kernel-src
+          
+          echo "== Clone susfs4ksu =="
+          git clone --depth=1 \
+            -b "${{ github.event.inputs.susfs_branch }}" \
+            "https://gitlab.com/simonpunk/susfs4ksu.git" susfs4ksu-src
+          
+          echo ""
+          echo "== STEP 1: Copy SUSFS source files =="
+          if [ -d "susfs4ksu-src/kernel_patches/fs" ]; then
+            cp -v susfs4ksu-src/kernel_patches/fs/* fs/
+          fi
+          if [ -d "susfs4ksu-src/kernel_patches/include/linux" ]; then
+            cp -v susfs4ksu-src/kernel_patches/include/linux/* include/linux/
+          fi
+          
+          echo ""
+          echo "== Verify SUSFS files =="
+          ls -la fs/susfs.c fs/sus_su.c include/linux/susfs.h include/linux/susfs_def.h 2>&1
+          grep "SUSFS_VERSION" include/linux/susfs.h | head -3
+          
+          echo ""
+          echo "== STEP 2: Patch KSU-Next untuk enable SUSFS =="
+          PATCH1="susfs4ksu-src/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
+          KSU_DIR="${{ env.KSU_DIR }}"
+          
+          if [ -f "$PATCH1" ] && [ -n "$KSU_DIR" ] && [ -d "$KSU_DIR" ]; then
+            echo "Patching $KSU_DIR/ ..."
+            
+            # Fix: patch expect 'KernelSU/' tapi kita punya '$KSU_DIR/'
+            # Buat copy patch yang sudah di-adjust path-nya
+            if [ "$KSU_DIR" != "KernelSU" ]; then
+              echo "Adjusting patch paths: KernelSU/ → $KSU_DIR/"
+              sed "s|a/KernelSU/|a/$KSU_DIR/|g; s|b/KernelSU/|b/$KSU_DIR/|g" \
+                "$PATCH1" > /tmp/patch1_fixed.patch
+              PATCH1="/tmp/patch1_fixed.patch"
+            fi
+            
+            set +e
+            patch -p1 --forward --fuzz=3 < "$PATCH1" 2>&1 | tee /tmp/patch1.log
+            set -e
+            
+            echo ""
+            echo "Patch 1 result:"
+            echo "  Succeed: $(grep -c 'succeeded' /tmp/patch1.log || echo 0)"
+            echo "  FAILED : $(grep -c 'FAILED' /tmp/patch1.log || echo 0)"
+            
+            # Show failed hunks for debug
+            if grep -q "FAILED" /tmp/patch1.log; then
+              echo ""
+              echo "== FAILED hunks detail =="
+              grep -B 1 "FAILED" /tmp/patch1.log | head -20
+            fi
+          else
+            echo "[WARN] Patch 1 not found or KSU_DIR empty"
+            echo "  PATCH1=$PATCH1 exists: $([ -f "$PATCH1" ] && echo yes || echo no)"
+            echo "  KSU_DIR=$KSU_DIR exists: $([ -d "$KSU_DIR" ] && echo yes || echo no)"
+          fi
+          
+          echo ""
+          echo "== STEP 3: Patch kernel source files =="
+          PATCH2=$(ls susfs4ksu-src/kernel_patches/50_add_susfs_in_kernel*.patch 2>/dev/null | head -1)
+          
+          if [ -n "$PATCH2" ]; then
+            echo "Applying: $(basename $PATCH2)"
+            
+            set +e
+            patch -p1 --forward --fuzz=3 < "$PATCH2" 2>&1 | tee /tmp/patch2.log
+            set -e
+            
+            echo ""
+            echo "Patch 2 result:"
+            echo "  Succeed: $(grep -c 'succeeded' /tmp/patch2.log || echo 0)"
+            echo "  FAILED : $(grep -c 'FAILED' /tmp/patch2.log || echo 0)"
+            
+            if grep -q "FAILED" /tmp/patch2.log; then
+              echo ""
+              echo "== FAILED hunks =="
+              grep -B 1 "FAILED" /tmp/patch2.log | head -20
+              
+              echo ""
+              echo "== .rej files =="
+              find . -name "*.rej" -not -path "./susfs4ksu-src/*" | while read f; do
+                echo "--- $f ---"
+                cat "$f"
+                echo ""
+              done
+            fi
+          else
+            echo "[WARN] Patch 2 not found"
+            ls -la susfs4ksu-src/kernel_patches/
+          fi
+          
+          # Cleanup
+          find . -name "*.rej" -not -path "./susfs4ksu-src/*" -delete 2>/dev/null || true
+          find . -name "*.orig" -not -path "./susfs4ksu-src/*" -delete 2>/dev/null || true
+          
+          echo ""
+          echo "== STEP 4: Verify Kconfig SUSFS =="
+          grep "KSU_SUSFS" drivers/kernelsu/Kconfig 2>/dev/null | head -5 || \
+            echo "[WARN] KSU_SUSFS not found in drivers/kernelsu/Kconfig"
+          
+          echo ""
+          echo "== Verify fs/Makefile has susfs =="
+          grep "susfs" fs/Makefile 2>/dev/null | head -5 || \
+            echo "[WARN] susfs not in fs/Makefile"
+
+      - name: Prepare defconfig
+        run: |
+          cd kernel-src
+          DEFCONFIG_PATH="arch/arm64/configs/${{ github.event.inputs.defconfig }}"
+          
+          if [ "${{ github.event.inputs.use_extracted_config }}" = "true" ]; then
+            EXTRACTED_CFG="$GITHUB_WORKSPACE/extracted-config/my_defconfig.txt"
+            [ -f "$EXTRACTED_CFG" ] && cp "$EXTRACTED_CFG" "$DEFCONFIG_PATH"
+          fi
+          
+          # Bersihkan entry lama
+          sed -i '/^CONFIG_KSU/d;/^# CONFIG_KSU is not set/d' "$DEFCONFIG_PATH"
+          sed -i '/SUSFS/d' "$DEFCONFIG_PATH"
+          
+          # Disable stack protector strong (problematic dengan Clang lama juga)
+          sed -i '/^CONFIG_CC_STACKPROTECTOR_STRONG=y/d' "$DEFCONFIG_PATH"
+          
+          # Append config
+          {
+            echo ""
+            echo "# === KernelSU-Next ==="
+            echo "CONFIG_KSU=y"
+            echo "CONFIG_KPROBES=y"
+            echo ""
+            echo "# === SUSFS ==="
+            echo "CONFIG_KSU_SUSFS=y"
+            echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
+            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y"
+            echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
+            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
+            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
+            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
+          } >> "$DEFCONFIG_PATH"
+          
+          echo "== Config check =="
+          grep -E "CONFIG_KSU|SUSFS" "$DEFCONFIG_PATH" | sort
+
+      - name: Patch arch/arm64/Makefile (fix vdso32)
+        run: |
+          cd kernel-src
+          MAIN_MK="arch/arm64/Makefile"
+          [ -f "$MAIN_MK" ] || exit 1
+          sed -i -E 's@(CLANG_PREFIX32[[:space:]]*:=[[:space:]]*--prefix=\$\(GCC_TOOLCHAIN32_DIR\))[[:space:]]*$@\1$(notdir $(CROSS_COMPILE_ARM32))@' "$MAIN_MK" 2>/dev/null || true
+
+      - name: Skip broken DTBs
+        run: |
+          cd kernel-src
+          DTS_MK="arch/arm64/boot/dts/qcom/Makefile"
+          [ -f "$DTS_MK" ] || exit 0
+          for dtb in sdm845-v2-qvr-evt.dtb sdm845-v2-qvr-dvt.dtb sdm845-interposer-sdm670-mtp.dtb sdm845-interposer-sdm670-cdp.dtb; do
+            sed -i "/$dtb/d" "$DTS_MK" 2>/dev/null || true
+          done
+
+      # ============================================================
+      # COMPILE: Clang r353983c + GCC 4.9 (TIDAK pakai LLVM=1)
+      # Mirror exact approach ravindu644
+      # ============================================================
+      - name: Compile Kernel
+        run: |
+          cd kernel-src
+          OUT_DIR="out"
+          
+          # Set toolchain paths (mirror ravindu644)
+          CLANG_PATH="$HOME/toolchains/clang/bin"
+          GCC_PATH="$HOME/toolchains/gcc-aarch64/bin"
+          GCC_ARM32_PATH="$HOME/toolchains/gcc-arm32/bin"
+          
+          export PATH="${CLANG_PATH}:${GCC_PATH}:${GCC_ARM32_PATH}:${PATH}"
+          
+          echo "== Toolchain versions =="
+          clang --version | head -3
+          ${GCC_PATH}/aarch64-linux-android-gcc --version | head -1
+          ${GCC_ARM32_PATH}/arm-linux-androideabi-gcc --version | head -1
+          
+          # Make args (mirror ravindu644 — TIDAK pakai LLVM=1 LLVM_IAS=1)
+          MAKE_ARGS=(
+            O=$OUT_DIR
+            ARCH=arm64
+            CC=clang
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-android-
+            CROSS_COMPILE_ARM32=arm-linux-androideabi-
+          )
+          
+          mkdir -p $OUT_DIR
+          make "${MAKE_ARGS[@]}" ${{ github.event.inputs.defconfig }}
+          
+          # Disable problematic configs (mirror ravindu644)
+          scripts/config --file $OUT_DIR/.config \
+            --disable CONFIG_CC_STACKPROTECTOR_STRONG \
+            --disable CONFIG_RANDOMIZE_BASE \
+            --disable LTO_CLANG \
+            --disable CFI_CLANG
+          
+          make "${MAKE_ARGS[@]}" olddefconfig
+          
+          echo "== Config check =="
+          for cfg in CONFIG_KSU CONFIG_KPROBES CONFIG_KSU_SUSFS; do
+            grep "^${cfg}=" $OUT_DIR/.config || echo "PERINGATAN: ${cfg} tidak aktif!"
+          done
+          
+          set +e
+          make -k -j$(nproc --all) "${MAKE_ARGS[@]}" \
+            KCFLAGS="-Wno-unknown-warning-option" \
+            2>&1 | tee build.log
+          BUILD_EXIT=${PIPESTATUS[0]}
+          set -e
+          
+          echo "== Exit code: $BUILD_EXIT =="
+          BUILD_OK=0
+          if [ -f "$OUT_DIR/arch/arm64/boot/Image.gz-dtb" ]; then
+            ls -la "$OUT_DIR/arch/arm64/boot/Image.gz-dtb"
+            BUILD_OK=1
+          elif [ -f "$OUT_DIR/arch/arm64/boot/Image" ]; then
+            ls -la "$OUT_DIR/arch/arm64/boot/Image"
+            BUILD_OK=1
+          fi
+          
+          echo "BUILD_OK=$BUILD_OK" >> "$GITHUB_ENV"
+          [ "$BUILD_OK" -eq 1 ] || exit 1
+
+      - name: Capture metadata
+        if: env.BUILD_OK == '1'
+        run: |
+          cd kernel-src
+          KERNEL_COMMIT=$(git rev-parse --short HEAD)
+          KSU_DIR="${{ env.KSU_DIR }}"
+          KSU_COMMIT="unknown"
+          [ -n "$KSU_DIR" ] && [ -d "$KSU_DIR" ] && KSU_COMMIT=$(cd "$KSU_DIR" && git rev-parse --short HEAD 2>/dev/null || echo "embedded")
+          SUSFS_VERSION=$(grep "SUSFS_VERSION" include/linux/susfs.h 2>/dev/null | grep -oE '"[^"]+"' | tr -d '"' || echo "unknown")
+          
+          cat > ../build-metadata.json << JSONEOF
+          {
+            "build_date": "$(date -u '+%Y-%m-%d %H:%M UTC')",
+            "kernel": {
+              "source": "${{ github.event.inputs.kernel_source }}",
+              "branch": "${{ github.event.inputs.kernel_branch }}",
+              "commit": "${KERNEL_COMMIT}",
+              "version": "$(cat out/include/config/kernel.release)"
+            },
+            "ksu_next": {
+              "tag": "${{ github.event.inputs.ksu_tag }}",
+              "commit": "${KSU_COMMIT}"
+            },
+            "susfs": {
+              "version": "${SUSFS_VERSION}",
+              "branch": "${{ github.event.inputs.susfs_branch }}"
+            },
+            "toolchain": {
+              "clang": "r353983c (Android 10 era)",
+              "gcc": "AOSP GCC 4.9 aarch64 + arm32"
+            },
+            "manager_apk": "https://t.me/ksunext_ci"
+          }
+          JSONEOF
+          cat ../build-metadata.json | jq .
+
+      - name: Upload metadata
+        if: env.BUILD_OK == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-metadata
+          path: build-metadata.json
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: kernel-src/build.log
+
+      - name: Upload Image.gz-dtb
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.zip_name }}-gz-dtb
+          path: kernel-src/out/arch/arm64/boot/Image.gz-dtb
+          if-no-files-found: ignore
+
+      - name: Upload Image Only
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.zip_name }}-raw
+          path: kernel-src/out/arch/arm64/boot/Image
+          if-no-files-found: ignore
