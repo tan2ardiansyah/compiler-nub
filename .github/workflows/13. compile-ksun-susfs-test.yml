@@ -1,4 +1,4 @@
-name: 13. Compile Kernel - BOS Beryllium + KSU-Next + SUSFS
+name: 1. Compile Kernel - BOS Beryllium + KSU-Next + SUSFS v2.2.0
 
 on:
   workflow_dispatch:
@@ -27,14 +27,18 @@ on:
         description: 'KernelSU-Next tag'
         required: false
         default: 'v3.3.0-enjoy'
-      susfs_repo:
-        description: 'SUSFS repo (fork non-GKI dari 1392726643)'
+      susfs_kconfig_repo:
+        description: 'SUSFS Kconfig source (fork 1392726643)'
         required: true
         default: 'https://gitlab.com/1392726643/susfs4ksu.git'
-      susfs_branch:
-        description: 'SUSFS branch (kernel-4.9 = 73 commits ahead, Feb 2025)'
+      susfs_kconfig_branch:
+        description: 'SUSFS Kconfig branch'
         required: true
         default: 'kernel-4.9'
+      susfs_patch_url:
+        description: 'SUSFS v2.2.0 patch (JackA1ltman)'
+        required: true
+        default: 'https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/Patch/susfs_patch_to_4.9.patch'
 
 jobs:
   build:
@@ -57,18 +61,19 @@ jobs:
             python3 python-is-python3 jq \
             libncurses5-dev libncursesw5-dev
 
-      - name: Setup Clang r353983c (kernel 4.9 compatible)
+      # ============================================================
+      # TOOLCHAIN: Clang r353983c + GCC 4.9 (proven untuk kernel 4.9)
+      # ============================================================
+      - name: Setup Clang r353983c
         run: |
           mkdir -p ~/toolchains/clang
           wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android10-release/clang-r353983c.tar.gz -O /tmp/clang.tar.gz
           FILE_SIZE=$(stat -c%s /tmp/clang.tar.gz)
           if [ "$FILE_SIZE" -lt 10000000 ]; then
-            echo "[WARN] Primary URL gagal, coba tag..."
             wget -q "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-10.0.0_r1/clang-r353983c.tar.gz" -O /tmp/clang.tar.gz
           fi
           tar -xzf /tmp/clang.tar.gz -C ~/toolchains/clang
           rm /tmp/clang.tar.gz
-          ~/toolchains/clang/bin/clang --version | head -3
 
       - name: Setup GCC 4.9 aarch64
         run: |
@@ -87,13 +92,15 @@ jobs:
           git clone --depth=1 "${{ github.event.inputs.kernel_source }}" \
             -b "${{ github.event.inputs.kernel_branch }}" kernel-src
 
+      # ============================================================
+      # STEP 1: Setup KSU-Next (ThRE-Team)
+      # ============================================================
       - name: Setup KernelSU-Next
         run: |
           cd kernel-src
           curl -LSs "https://raw.githubusercontent.com/ThRE-Team/KernelSU-Next/main/kernel/setup.sh" \
             | bash -s "${{ github.event.inputs.ksu_tag }}"
-          
-          # Detect KSU folder name
+
           KSU_DIR=""
           for d in KernelSU-Next KernelSU; do
             [ -d "$d" ] && { KSU_DIR="$d"; break; }
@@ -103,38 +110,29 @@ jobs:
           ls -la drivers/kernelsu || echo "MISSING!"
 
       # ============================================================
-      # SUSFS: fork 1392726643 (73 commits ahead, non-GKI optimized)
-      # Approach: copy files dulu, baru patch (issue #426)
+      # STEP 2: Inject Kconfig SUSFS ke KSU-Next
+      # Source: fork 1392726643 (73 commits ahead, non-GKI optimized)
       # ============================================================
-      - name: Setup SUSFS (copy + patch)
+      - name: Inject Kconfig SUSFS ke KSU-Next
         run: |
           cd kernel-src
           KSU_DIR="${{ env.KSU_DIR }}"
 
-          echo "== Clone SUSFS fork (non-GKI optimized) =="
+          echo "== Clone SUSFS Kconfig source =="
           git clone --depth=1 \
-            -b "${{ github.event.inputs.susfs_branch }}" \
-            "${{ github.event.inputs.susfs_repo }}" susfs4ksu-src
+            -b "${{ github.event.inputs.susfs_kconfig_branch }}" \
+            "${{ github.event.inputs.susfs_kconfig_repo }}" /tmp/susfs-kconfig
 
-          echo ""
-          echo "== STEP 1: Copy SUSFS source files =="
-          cp -v susfs4ksu-src/kernel_patches/fs/* fs/
-          cp -v susfs4ksu-src/kernel_patches/include/linux/* include/linux/
-          echo ""
-          echo "SUSFS version:"
-          grep "SUSFS_VERSION" include/linux/susfs.h | head -3
+          PATCH1="/tmp/susfs-kconfig/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
 
-          echo ""
-          echo "== STEP 2: Patch KSU-Next (skip selinux, handle manual) =="
-          PATCH1="susfs4ksu-src/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
-          KSU_DIR="${{ env.KSU_DIR }}"
-          
-          if [ -f "$PATCH1" ] && [ -n "$KSU_DIR" ] && [ -d "$KSU_DIR" ]; then
-            # BACKUP selinux files SEBELUM patch (karena patch rusak di selinux)
+          if [ -f "$PATCH1" ] && [ -d "$KSU_DIR" ]; then
+            # BACKUP selinux files SEBELUM patch (patch akan rusak mereka)
             cp "$KSU_DIR/kernel/selinux/selinux.c" /tmp/selinux.c.bak
             cp "$KSU_DIR/kernel/selinux/selinux.h" /tmp/selinux.h.bak
             cp "$KSU_DIR/kernel/selinux/rules.c" /tmp/rules.c.bak
-            
+            echo "[OK] SELinux files backed up"
+
+            # Apply patch (Kconfig akan berhasil, selinux akan gagal)
             cp "$PATCH1" "$KSU_DIR/"
             cd "$KSU_DIR"
             set +e
@@ -142,54 +140,62 @@ jobs:
             set -e
             rm -f 10_enable_susfs_for_ksu.patch
             cd ..
-            
+
             echo ""
-            echo "Patch 1: Succeed=$(grep -c 'succeeded' /tmp/patch1.log) FAILED=$(grep -c 'FAILED' /tmp/patch1.log)"
-            
-            # RESTORE selinux files (karena patch rusakin mereka)
-            echo ""
-            echo "== Restore selinux files (patch corrupt mereka) =="
+            echo "Patch Kconfig: Succeed=$(grep -c 'succeeded' /tmp/patch1.log) FAILED=$(grep -c 'FAILED' /tmp/patch1.log)"
+
+            # RESTORE selinux files (patch corrupt mereka karena nama function beda)
             cp /tmp/selinux.c.bak "$KSU_DIR/kernel/selinux/selinux.c"
             cp /tmp/selinux.h.bak "$KSU_DIR/kernel/selinux/selinux.h"
             cp /tmp/rules.c.bak "$KSU_DIR/kernel/selinux/rules.c"
-            echo "[OK] selinux files restored ke original"
+            echo "[OK] SELinux files restored"
           fi
 
+          rm -rf /tmp/susfs-kconfig
+
           echo ""
-          echo "== STEP 3: Patch kernel core files =="
-          PATCH2=$(ls susfs4ksu-src/kernel_patches/50_add_susfs_in_kernel*.patch 2>/dev/null | head -1)
-          if [ -n "$PATCH2" ]; then
-            echo "Apply: $(basename $PATCH2)"
-            set +e
-            patch -p1 --forward --fuzz=3 < "$PATCH2" 2>&1 | tee /tmp/patch2.log
-            set -e
+          echo "== Verify Kconfig SUSFS =="
+          grep "KSU_SUSFS" "$KSU_DIR/kernel/Kconfig" | head -5
+
+      # ============================================================
+      # STEP 3: Apply patch JackA1ltman (SUSFS v2.2.0 files + kernel mods)
+      # Proven dari ReSukiSU workflow
+      # ============================================================
+      - name: Apply SUSFS v2.2.0 patch (JackA1ltman)
+        run: |
+          cd kernel-src
+
+          echo "== Download patch =="
+          curl -LSsf "${{ github.event.inputs.susfs_patch_url }}" -o /tmp/susfs.patch
+          echo "Patch size: $(wc -c < /tmp/susfs.patch) bytes"
+
+          echo ""
+          echo "== Apply patch =="
+          set +e
+          patch -p1 --fuzz=3 --no-backup-if-mismatch --force < /tmp/susfs.patch 2>&1 | tee /tmp/patch2.log
+          set -e
+
+          echo ""
+          echo "Patch kernel: Succeed=$(grep -c 'succeeded' /tmp/patch2.log) FAILED=$(grep -c 'FAILED' /tmp/patch2.log)"
+
+          if grep -q "FAILED" /tmp/patch2.log; then
             echo ""
-            echo "Patch 2: Succeed=$(grep -c 'succeeded' /tmp/patch2.log) FAILED=$(grep -c 'FAILED' /tmp/patch2.log)"
-            
-            if grep -q "FAILED" /tmp/patch2.log; then
-              echo ""
-              echo "== FAILED hunks =="
-              grep -B 1 "FAILED" /tmp/patch2.log | head -20
-            fi
+            echo "== FAILED hunks =="
+            grep -B 1 "FAILED" /tmp/patch2.log | head -20
           fi
 
-          find . -name "*.rej" -not -path "./susfs4ksu-src/*" -delete 2>/dev/null || true
-          find . -name "*.orig" -not -path "./susfs4ksu-src/*" -delete 2>/dev/null || true
+          find . -name "*.rej" -delete 2>/dev/null || true
+          find . -name "*.orig" -delete 2>/dev/null || true
 
           echo ""
-          echo "== STEP 4: Verify =="
-          echo "Kconfig SUSFS:"
-          grep "KSU_SUSFS" "$KSU_DIR/kernel/Kconfig" 2>/dev/null | head -5 || \
-            grep "KSU_SUSFS" drivers/kernelsu/Kconfig 2>/dev/null | head -5 || \
-            echo "[WARN] KSU_SUSFS not found in Kconfig"
-          echo ""
-          echo "fs/Makefile:"
-          grep "susfs" fs/Makefile 2>/dev/null | head -5 || echo "[WARN] susfs not in fs/Makefile"
-          echo ""
-          echo "Files:"
+          echo "== Verify SUSFS v2.2.0 =="
+          grep "SUSFS_VERSION" include/linux/susfs.h | head -3
           ls -la fs/susfs.c fs/sus_su.c include/linux/susfs.h 2>&1
 
-      - name: Manual fix SUSFS hunks (kalau patch 2 ada yang gagal)
+      # ============================================================
+      # STEP 4: Manual fix hunks yang gagal (proven dari ReSukiSU)
+      # ============================================================
+      - name: Manual fix SUSFS hunks
         run: |
           cd kernel-src
 
@@ -299,7 +305,10 @@ jobs:
           PYEOF
           fi
 
-      - name: Fix SELinux SUSFS (inject ke file bersih)
+      # ============================================================
+      # STEP 5: Fix SELinux SUSFS (backup → restore → inject clean)
+      # ============================================================
+      - name: Fix SELinux SUSFS
         env:
           KSU_DIR: ${{ env.KSU_DIR }}
         run: |
@@ -319,8 +328,7 @@ jobs:
           idx = len(lines) - 1
           for i, line in enumerate(lines):
               if 'ksu_apply_kernelsu_rules' in line or 'apply_kernelsu_rules' in line:
-                  idx = i + 1
-                  break
+                  idx = i + 1; break
           decl = ['',
               '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT',
               'bool susfs_is_sid_equal(void *sec, u32 sid2);',
@@ -350,24 +358,18 @@ jobs:
           text = p.read_text()
           marker = '#define KERNEL_SU_DOMAIN'
           devpts = '#define DEVPTS_DOMAIN'
-          if marker not in text:
-              print("[SKIP] marker not found")
-              exit(0)
+          if marker not in text: exit(0)
           idx = text.find(marker)
           eol = text.find('\n', idx) + 1
-          v = "\n".join(["",
-              "#ifdef CONFIG_KSU_SUSFS",
+          v = "\n".join(["", "#ifdef CONFIG_KSU_SUSFS",
               '#define KERNEL_INIT_DOMAIN "u:r:init:s0"',
               '#define KERNEL_ZYGOTE_DOMAIN "u:r:zygote:s0"',
-              "u32 susfs_ksu_sid = 0;",
-              "u32 susfs_init_sid = 0;",
-              "u32 susfs_zygote_sid = 0;",
-              "#endif", ""])
+              "u32 susfs_ksu_sid = 0;", "u32 susfs_init_sid = 0;",
+              "u32 susfs_zygote_sid = 0;", "#endif", ""])
           text = text[:eol] + v + text[eol:]
-          if devpts in text:
+          if devpts in text and 'susfs_set_sid' not in text:
               idx2 = text.find(devpts)
-              f = "\n".join(["",
-                  "#ifdef CONFIG_KSU_SUSFS",
+              f = "\n".join(["", "#ifdef CONFIG_KSU_SUSFS",
                   "static inline void susfs_set_sid(const char *n, u32 *o)",
                   "{ int e; if(!n||!o)return;",
                   "  e=security_secctx_to_secid(n,strlen(n),o); if(e)return; }",
@@ -426,6 +428,149 @@ jobs:
             echo "  $(basename $f): $(grep -c susfs $f 2>/dev/null || echo 0) refs"
           done
 
+      # ============================================================
+      # STEP 6: Extract hook signatures dari KSU-Next source
+      # ============================================================
+      - name: Extract hook signatures dari KSU-Next
+        run: |
+          cd kernel-src
+          KSU_DIR="${{ env.KSU_DIR }}"
+
+          echo "== Cari ksu_handle_* implementations =="
+          grep -rn "^int ksu_handle_\|^void ksu_handle_" "$KSU_DIR/" 2>/dev/null | head -20
+
+          echo ""
+          echo "== Generate ksu_hook.h =="
+          python3 << 'PYEOF'
+          import re, os
+          from pathlib import Path
+          ksu_dirs = ['KernelSU-Next', 'KernelSU']
+          ksu_dir = next((d for d in ksu_dirs if Path(d).exists()), None)
+          if not ksu_dir: print("[SKIP]"); exit(0)
+          sigs = {}
+          for pattern in ['*.c', '*.h']:
+              for f in Path(ksu_dir).rglob(pattern):
+                  try: text = f.read_text(errors='replace')
+                  except: continue
+                  for m in re.finditer(r'\b(?:int|void)\s+(ksu_handle_\w+)\s*\(([^)]*)\)\s*[;{]', text, re.MULTILINE):
+                      name, params = m.group(1), m.group(2).strip()
+                      rettype = 'int' if m.group(0).strip().startswith('int') else 'void'
+                      if name == 'ksu_handle_stat':
+                          if 'const char __user' in params: sigs[name] = (rettype, params)
+                          elif name not in sigs: sigs[name] = (rettype, params)
+                      else:
+                          if name not in sigs or '{' in text[m.end()-1:m.end()]:
+                              sigs[name] = (rettype, params)
+          wajib = {'ksu_handle_execveat','ksu_handle_faccessat','ksu_handle_stat',
+                   'ksu_handle_sys_read','ksu_handle_setresuid','ksu_handle_sys_reboot',
+                   'ksu_handle_input_handle_event'}
+          header = ['/* Auto-generated ksu_hook.h */', '#ifndef __KSU_HOOK_H',
+              '#define __KSU_HOOK_H', '', '#include <linux/types.h>',
+              '#include <linux/uidgid.h>', '', 'struct file;', 'struct filename;', '']
+          for name in sorted(wajib):
+              if name in sigs:
+                  rt, p = sigs[name]
+                  header.append(f'extern {rt} {name}({p});')
+                  print(f"  + {rt} {name}({p})")
+              else: print(f"  ! Missing: {name}")
+          header.extend(['', '#endif'])
+          Path('include/linux/ksu_hook.h').write_text('\n'.join(header))
+          print("\n[OK] ksu_hook.h generated")
+          PYEOF
+
+      # ============================================================
+      # STEP 7: Inject 7 manual hooks (proven dari ReSukiSU v6)
+      # ============================================================
+      - name: Inject 7 manual hooks
+        run: |
+          cd kernel-src
+
+          inject_hook() {
+            local file="$1" func_pat="$2" hook_line="$3"
+            [ -f "$file" ] || return 1
+            awk -v pat="$func_pat" -v hook="$hook_line" '
+              $0 ~ pat { in_func=1 }
+              in_func && /^\{/ && !done {
+                print; print "\t/* KSU hook */"; print "\t" hook
+                done=1; in_func=0; next
+              }
+              { print }
+            ' "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+          }
+
+          add_include() {
+            local file="$1"
+            [ -f "$file" ] || return
+            if ! grep -q "linux/ksu_hook.h" "$file"; then
+              sed -i '0,/^#include/s||#include <linux/ksu_hook.h>\n&|' "$file"
+            fi
+          }
+
+          # 1. execveat
+          add_include fs/exec.c
+          if ! grep -q "ksu_handle_execveat" fs/exec.c; then
+            inject_hook fs/exec.c "static int do_execveat_common" \
+              "ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);"
+            [ $? -ne 0 ] && inject_hook fs/exec.c "int do_execveat_common" \
+              "ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);"
+          fi
+
+          # 2. faccessat
+          add_include fs/open.c
+          if ! grep -q "ksu_handle_faccessat" fs/open.c; then
+            inject_hook fs/open.c "SYSCALL_DEFINE3.faccessat" \
+              "ksu_handle_faccessat(&dfd, &filename, &mode, NULL);"
+          fi
+
+          # 3. stat
+          add_include fs/stat.c
+          if ! grep -q "ksu_handle_stat" fs/stat.c; then
+            inject_hook fs/stat.c "SYSCALL_DEFINE4.newfstatat" \
+              "ksu_handle_stat(&dfd, &filename, &flag);"
+          fi
+
+          # 4. sys_read
+          add_include fs/read_write.c
+          if ! grep -q "ksu_handle_sys_read" fs/read_write.c; then
+            inject_hook fs/read_write.c "SYSCALL_DEFINE3.read" \
+              "ksu_handle_sys_read(fd, &buf, &count);"
+          fi
+
+          # 5. setresuid
+          add_include kernel/sys.c
+          if ! grep -q "ksu_handle_setresuid" kernel/sys.c; then
+            inject_hook kernel/sys.c "SYSCALL_DEFINE3.setresuid" \
+              "ksu_handle_setresuid(ruid, euid, suid);"
+          fi
+
+          # 6. sys_reboot
+          add_include kernel/reboot.c
+          if [ -f kernel/reboot.c ] && ! grep -q "ksu_handle_sys_reboot" kernel/reboot.c; then
+            inject_hook kernel/reboot.c "SYSCALL_DEFINE4.reboot" \
+              "ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);"
+          fi
+
+          # 7. input_handle_event
+          add_include drivers/input/input.c
+          if ! grep -q "ksu_handle_input_handle_event" drivers/input/input.c; then
+            inject_hook drivers/input/input.c "void input_handle_event" \
+              "ksu_handle_input_handle_event(&type, &code, &value);"
+            if ! grep -q "ksu_handle_input_handle_event" drivers/input/input.c; then
+              inject_hook drivers/input/input.c "static void input_handle_event" \
+                "ksu_handle_input_handle_event(&type, &code, &value);"
+            fi
+          fi
+
+          echo "== Verify 7 hooks =="
+          for f in fs/exec.c fs/open.c fs/stat.c fs/read_write.c kernel/sys.c kernel/reboot.c drivers/input/input.c; do
+            [ -f "$f" ] || continue
+            HOOKS=$(grep -o "ksu_handle_[a-z_]*" "$f" 2>/dev/null | sort -u | tr '\n' ' ')
+            echo "  $f -> ${HOOKS:-NONE}"
+          done
+
+      # ============================================================
+      # STEP 8: Prepare defconfig
+      # ============================================================
       - name: Prepare defconfig
         run: |
           cd kernel-src
@@ -440,16 +585,12 @@ jobs:
           sed -i '/SUSFS/d' "$DEFCONFIG_PATH"
           sed -i '/^CONFIG_CC_STACKPROTECTOR_STRONG=y/d' "$DEFCONFIG_PATH"
 
-          # Non-GKI: manual hook, disable kprobe hooks
           {
             echo ""
-            echo "# === KernelSU-Next (manual hook for SUSFS) ==="
             echo "CONFIG_KSU=y"
             echo "CONFIG_KPROBES=y"
             echo ""
-            echo "# === SUSFS v1.5.5 (fork non-GKI) ==="
             echo "CONFIG_KSU_SUSFS=y"
-            echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y"
             echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
             echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
             echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
@@ -457,10 +598,13 @@ jobs:
             echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
             echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
             echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
+            echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
+            echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
             echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_SU=y"
           } >> "$DEFCONFIG_PATH"
 
-          echo "== Config check =="
+          echo "== Config =="
           grep -E "CONFIG_KSU|SUSFS" "$DEFCONFIG_PATH" | sort
 
       - name: Patch arch/arm64/Makefile
@@ -477,7 +621,10 @@ jobs:
             sed -i "/$dtb/d" "$DTS_MK" 2>/dev/null || true
           done
 
-      - name: Compile Kernel (Clang r353983c + GCC 4.9)
+      # ============================================================
+      # STEP 9: Compile (Clang r353983c + GCC 4.9, NO LLVM=1)
+      # ============================================================
+      - name: Compile Kernel
         run: |
           cd kernel-src
           OUT_DIR="out"
@@ -486,10 +633,6 @@ jobs:
           GCC_PATH="$HOME/toolchains/gcc-aarch64/bin"
           GCC_ARM32_PATH="$HOME/toolchains/gcc-arm32/bin"
           export PATH="${CLANG_PATH}:${GCC_PATH}:${GCC_ARM32_PATH}:${PATH}"
-
-          echo "== Toolchain =="
-          clang --version | head -1
-          ${GCC_PATH}/aarch64-linux-android-gcc --version | head -1
 
           MAKE_ARGS=(
             O=$OUT_DIR ARCH=arm64
@@ -512,7 +655,7 @@ jobs:
 
           echo "== Config final =="
           for cfg in CONFIG_KSU CONFIG_KSU_SUSFS CONFIG_KPROBES; do
-            grep "^${cfg}=" $OUT_DIR/.config || echo "PERINGATAN: ${cfg} tidak aktif!"
+            grep "^${cfg}=" $OUT_DIR/.config || echo "WARN: ${cfg} NOT SET"
           done
 
           set +e
@@ -522,7 +665,7 @@ jobs:
           BUILD_EXIT=${PIPESTATUS[0]}
           set -e
 
-          echo "== Exit code: $BUILD_EXIT =="
+          echo "== Exit: $BUILD_EXIT =="
           BUILD_OK=0
           [ -f "$OUT_DIR/arch/arm64/boot/Image.gz-dtb" ] && { ls -la "$OUT_DIR/arch/arm64/boot/Image.gz-dtb"; BUILD_OK=1; }
           [ -f "$OUT_DIR/arch/arm64/boot/Image" ] && [ "$BUILD_OK" -eq 0 ] && { ls -la "$OUT_DIR/arch/arm64/boot/Image"; BUILD_OK=1; }
@@ -534,9 +677,8 @@ jobs:
         run: |
           cd kernel-src
           KSU_DIR="${{ env.KSU_DIR }}"
-          KSU_COMMIT="unknown"
-          [ -n "$KSU_DIR" ] && [ -d "$KSU_DIR" ] && KSU_COMMIT=$(cd "$KSU_DIR" && git rev-parse --short HEAD 2>/dev/null || echo "embedded")
-          SUSFS_VERSION=$(grep "SUSFS_VERSION" include/linux/susfs.h 2>/dev/null | grep -oE '"[^"]+"' | tr -d '"' || echo "unknown")
+          KSU_COMMIT=$([ -d "$KSU_DIR" ] && cd "$KSU_DIR" && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+          SUSFS_VER=$(grep "SUSFS_VERSION" include/linux/susfs.h 2>/dev/null | grep -oE '"[^"]+"' | tr -d '"' || echo "unknown")
           cat > ../build-metadata.json << JSONEOF
           {
             "build_date": "$(date -u '+%Y-%m-%d %H:%M UTC')",
@@ -546,17 +688,11 @@ jobs:
               "commit": "$(git rev-parse --short HEAD)",
               "version": "$(cat out/include/config/kernel.release)"
             },
-            "ksu_next": {
-              "tag": "${{ github.event.inputs.ksu_tag }}",
-              "commit": "${KSU_COMMIT}"
-            },
-            "susfs": {
-              "version": "${SUSFS_VERSION}",
-              "repo": "${{ github.event.inputs.susfs_repo }}",
-              "branch": "${{ github.event.inputs.susfs_branch }}"
-            },
+            "ksu_next": { "tag": "${{ github.event.inputs.ksu_tag }}", "commit": "${KSU_COMMIT}" },
+            "susfs": { "version": "${SUSFS_VER}" },
             "toolchain": "Clang r353983c + GCC 4.9",
-            "manager": "https://t.me/ksunext_ci"
+            "manager": "https://t.me/ksunext_ci",
+            "hooks": "manual (7 hooks)"
           }
           JSONEOF
           cat ../build-metadata.json | jq .
