@@ -346,7 +346,11 @@ jobs:
               if 'ksu_apply_kernelsu_rules' in line or 'apply_kernelsu_rules' in line:
                   idx = i + 1; break
           decl = ['',
-              '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT',
+              '#ifdef CONFIG_KSU_SUSFS',
+              'extern u32 susfs_ksu_sid;',
+              'extern u32 susfs_init_sid;',
+              'extern u32 susfs_zygote_sid;',
+              'extern u32 susfs_priv_app_sid;',
               'bool susfs_is_sid_equal(void *sec, u32 sid2);',
               'u32 susfs_get_sid_from_name(const char *secctx_name);',
               'u32 susfs_get_current_sid(void);',
@@ -364,7 +368,7 @@ jobs:
           fi
 
           echo ""
-          echo "== Fix 2: selinux.c =="
+          echo "== Fix 2: selinux.c (with EXPORT_SYMBOL) =="
           if [ -f "$SELINUX_C" ] && ! grep -q "susfs_ksu_sid" "$SELINUX_C"; then
             python3 - "$SELINUX_C" << 'PYEOF'
           import sys
@@ -375,37 +379,67 @@ jobs:
           marker = '#define KERNEL_SU_DOMAIN'
           devpts = '#define DEVPTS_DOMAIN'
           if marker not in text: exit(0)
+
+          # Inject variables setelah KERNEL_SU_DOMAIN
           idx = text.find(marker)
           eol = text.find('\n', idx) + 1
           v = "\n".join(["", "#ifdef CONFIG_KSU_SUSFS",
               '#define KERNEL_INIT_DOMAIN "u:r:init:s0"',
               '#define KERNEL_ZYGOTE_DOMAIN "u:r:zygote:s0"',
-              "u32 susfs_ksu_sid = 0;", "u32 susfs_init_sid = 0;",
-              "u32 susfs_zygote_sid = 0;", "#endif", ""])
+              "u32 susfs_ksu_sid = 0;",
+              "EXPORT_SYMBOL(susfs_ksu_sid);",
+              "u32 susfs_init_sid = 0;",
+              "EXPORT_SYMBOL(susfs_init_sid);",
+              "u32 susfs_zygote_sid = 0;",
+              "EXPORT_SYMBOL(susfs_zygote_sid);",
+              "u32 susfs_priv_app_sid = 0;",
+              "EXPORT_SYMBOL(susfs_priv_app_sid);",
+              "#endif", ""])
           text = text[:eol] + v + text[eol:]
+
+          # Inject functions sebelum DEVPTS_DOMAIN (with EXPORT_SYMBOL)
           if devpts in text and 'susfs_set_sid' not in text:
               idx2 = text.find(devpts)
               f = "\n".join(["", "#ifdef CONFIG_KSU_SUSFS",
                   "static inline void susfs_set_sid(const char *n, u32 *o)",
                   "{ int e; if(!n||!o)return;",
                   "  e=security_secctx_to_secid(n,strlen(n),o); if(e)return; }",
+                  "",
                   "bool susfs_is_sid_equal(void *sec, u32 sid2) {",
                   "  struct task_security_struct *t=(struct task_security_struct*)sec;",
                   "  if(!t)return false; return t->sid==sid2; }",
+                  "EXPORT_SYMBOL(susfs_is_sid_equal);",
+                  "",
                   "u32 susfs_get_sid_from_name(const char *n) {",
                   "  u32 o=0; int e; if(!n)return 0;",
                   "  e=security_secctx_to_secid(n,strlen(n),&o); if(e)return 0; return o; }",
+                  "EXPORT_SYMBOL(susfs_get_sid_from_name);",
+                  "",
                   "u32 susfs_get_current_sid(void) { return current_sid(); }",
+                  "EXPORT_SYMBOL(susfs_get_current_sid);",
+                  "",
                   "void susfs_set_zygote_sid(void) { susfs_set_sid(KERNEL_ZYGOTE_DOMAIN,&susfs_zygote_sid); }",
+                  "EXPORT_SYMBOL(susfs_set_zygote_sid);",
+                  "",
                   "bool susfs_is_current_zygote_domain(void) { return unlikely(current_sid()==susfs_zygote_sid); }",
+                  "EXPORT_SYMBOL(susfs_is_current_zygote_domain);",
+                  "",
                   "void susfs_set_ksu_sid(void) { susfs_set_sid(KERNEL_SU_DOMAIN,&susfs_ksu_sid); }",
+                  "EXPORT_SYMBOL(susfs_set_ksu_sid);",
+                  "",
                   "bool susfs_is_current_ksu_domain(void) { return unlikely(current_sid()==susfs_ksu_sid); }",
+                  "EXPORT_SYMBOL(susfs_is_current_ksu_domain);",
+                  "",
                   "void susfs_set_init_sid(void) { susfs_set_sid(KERNEL_INIT_DOMAIN,&susfs_init_sid); }",
+                  "EXPORT_SYMBOL(susfs_set_init_sid);",
+                  "",
                   "bool susfs_is_current_init_domain(void) { return unlikely(current_sid()==susfs_init_sid); }",
+                  "EXPORT_SYMBOL(susfs_is_current_init_domain);",
                   "#endif", "", ""])
               text = text[:idx2] + f + text[idx2:]
+
           p.write_text(text)
-          print("[OK] selinux.c")
+          print("[OK] selinux.c with EXPORT_SYMBOL")
           PYEOF
           fi
 
@@ -441,7 +475,7 @@ jobs:
           echo ""
           echo "== Verify =="
           for f in "$SELINUX_H" "$SELINUX_C" "$RULES_C"; do
-            echo "  $(basename $f): $(grep -c susfs $f 2>/dev/null || echo 0) refs"
+            echo "  $(basename $f): $(grep -c susfs $f 2>/dev/null || echo 0) refs, $(grep -c EXPORT_SYMBOL $f 2>/dev/null || echo 0) exports"
           done
 
       # ============================================================
