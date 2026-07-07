@@ -151,8 +151,6 @@ jobs:
             echo "[OK] SELinux files restored"
           fi
 
-          rm -rf /tmp/susfs-kconfig
-
           echo ""
           echo "== Verify Kconfig SUSFS =="
           grep "KSU_SUSFS" "$KSU_DIR/kernel/Kconfig" | head -5
@@ -187,10 +185,28 @@ jobs:
           find . -name "*.rej" -delete 2>/dev/null || true
           find . -name "*.orig" -delete 2>/dev/null || true
 
+          # Copy sus_su.c dari fork (tidak ada di patch JackA1ltman)
+          if [ ! -f fs/sus_su.c ] && [ -f /tmp/susfs-kconfig/kernel_patches/fs/sus_su.c ]; then
+            cp /tmp/susfs-kconfig/kernel_patches/fs/sus_su.c fs/sus_su.c
+            echo "[OK] sus_su.c copied dari fork"
+          fi
+          
+          # Copy sus_su.h juga kalau ada
+          if [ ! -f include/linux/sus_su.h ] && [ -f /tmp/susfs-kconfig/kernel_patches/include/linux/sus_su.h ]; then
+            cp /tmp/susfs-kconfig/kernel_patches/include/linux/sus_su.h include/linux/sus_su.h
+            echo "[OK] sus_su.h copied dari fork"
+          fi
+
           echo ""
           echo "== Verify SUSFS v2.2.0 =="
           grep "SUSFS_VERSION" include/linux/susfs.h | head -3
-          ls -la fs/susfs.c fs/sus_su.c include/linux/susfs.h 2>&1
+          echo "Files:"
+          ls -la fs/susfs.c fs/sus_su.c include/linux/susfs.h include/linux/susfs_def.h 2>/dev/null || true
+
+      # Cleanup temp setelah semua step SUSFS selesai
+      - name: Cleanup temp files
+        if: always()
+        run: rm -rf /tmp/susfs-kconfig /tmp/susfs.patch
 
       # ============================================================
       # STEP 4: Manual fix hunks yang gagal (proven dari ReSukiSU)
