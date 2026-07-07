@@ -125,21 +125,34 @@ jobs:
           grep "SUSFS_VERSION" include/linux/susfs.h | head -3
 
           echo ""
-          echo "== STEP 2: Patch KSU-Next Kconfig + Makefile =="
+          echo "== STEP 2: Patch KSU-Next (skip selinux, handle manual) =="
           PATCH1="susfs4ksu-src/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
+          KSU_DIR="${{ env.KSU_DIR }}"
+          
           if [ -f "$PATCH1" ] && [ -n "$KSU_DIR" ] && [ -d "$KSU_DIR" ]; then
-            echo "Apply patch inside $KSU_DIR/ ..."
+            # BACKUP selinux files SEBELUM patch (karena patch rusak di selinux)
+            cp "$KSU_DIR/kernel/selinux/selinux.c" /tmp/selinux.c.bak
+            cp "$KSU_DIR/kernel/selinux/selinux.h" /tmp/selinux.h.bak
+            cp "$KSU_DIR/kernel/selinux/rules.c" /tmp/rules.c.bak
+            
             cp "$PATCH1" "$KSU_DIR/"
             cd "$KSU_DIR"
             set +e
             patch -p1 --forward --fuzz=3 < 10_enable_susfs_for_ksu.patch 2>&1 | tee /tmp/patch1.log
             set -e
-            echo ""
-            echo "Patch 1: Succeed=$(grep -c 'succeeded' /tmp/patch1.log) FAILED=$(grep -c 'FAILED' /tmp/patch1.log)"
             rm -f 10_enable_susfs_for_ksu.patch
             cd ..
-          else
-            echo "[WARN] Patch 1 not found or KSU_DIR missing"
+            
+            echo ""
+            echo "Patch 1: Succeed=$(grep -c 'succeeded' /tmp/patch1.log) FAILED=$(grep -c 'FAILED' /tmp/patch1.log)"
+            
+            # RESTORE selinux files (karena patch rusakin mereka)
+            echo ""
+            echo "== Restore selinux files (patch corrupt mereka) =="
+            cp /tmp/selinux.c.bak "$KSU_DIR/kernel/selinux/selinux.c"
+            cp /tmp/selinux.h.bak "$KSU_DIR/kernel/selinux/selinux.h"
+            cp /tmp/rules.c.bak "$KSU_DIR/kernel/selinux/rules.c"
+            echo "[OK] selinux files restored ke original"
           fi
 
           echo ""
@@ -286,12 +299,11 @@ jobs:
           PYEOF
           fi
 
-      - name: Fix SELinux SUSFS
+      - name: Fix SELinux SUSFS (inject ke file bersih)
         env:
           KSU_DIR: ${{ env.KSU_DIR }}
         run: |
           cd kernel-src
-
           SELINUX_H="${KSU_DIR}/kernel/selinux/selinux.h"
           SELINUX_C="${KSU_DIR}/kernel/selinux/selinux.c"
           RULES_C="${KSU_DIR}/kernel/selinux/rules.c"
@@ -309,8 +321,7 @@ jobs:
               if 'ksu_apply_kernelsu_rules' in line or 'apply_kernelsu_rules' in line:
                   idx = i + 1
                   break
-          decl = [
-              '',
+          decl = ['',
               '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT',
               'bool susfs_is_sid_equal(void *sec, u32 sid2);',
               'u32 susfs_get_sid_from_name(const char *secctx_name);',
@@ -321,149 +332,99 @@ jobs:
               'bool susfs_is_current_ksu_domain(void);',
               'void susfs_set_init_sid(void);',
               'bool susfs_is_current_init_domain(void);',
-              '#endif',
-              '',
-          ]
+              '#endif', '']
           lines[idx:idx] = decl
           p.write_text('\n'.join(lines))
-          print("[OK] selinux.h fixed")
+          print("[OK] selinux.h")
           PYEOF
           fi
 
           echo ""
-          echo "== Fix 2: selinux.c — RESET dari git lalu inject clean =="
-          if [ -f "$SELINUX_C" ]; then
-            # Reset selinux.c ke versi ORIGINAL dari KSU-Next (sebelum patch rusak)
-            cd "$KSU_DIR"
-            git checkout -- kernel/selinux/selinux.c 2>/dev/null || true
-            cd ..
-            echo "[OK] selinux.c reset ke original"
-            
-            # Sekarang inject SUSFS clean ke file yang bersih
+          echo "== Fix 2: selinux.c =="
+          if [ -f "$SELINUX_C" ] && ! grep -q "susfs_ksu_sid" "$SELINUX_C"; then
             python3 - "$SELINUX_C" << 'PYEOF'
           import sys
           from pathlib import Path
           p = Path(sys.argv[1])
           if not p.exists(): exit(0)
           text = p.read_text()
-
-          # Inject variables setelah KERNEL_SU_DOMAIN
           marker = '#define KERNEL_SU_DOMAIN'
-          if marker in text and 'susfs_ksu_sid' not in text:
-              idx = text.find(marker)
-              eol = text.find('\n', idx) + 1
-              susfs_vars = "\n".join([
-                  "",
-                  "#ifdef CONFIG_KSU_SUSFS",
-                  '#define KERNEL_INIT_DOMAIN "u:r:init:s0"',
-                  '#define KERNEL_ZYGOTE_DOMAIN "u:r:zygote:s0"',
-                  "u32 susfs_ksu_sid = 0;",
-                  "u32 susfs_init_sid = 0;",
-                  "u32 susfs_zygote_sid = 0;",
-                  "#endif",
-                  "",
-              ])
-              text = text[:eol] + susfs_vars + text[eol:]
-
-          # Inject functions sebelum DEVPTS_DOMAIN
           devpts = '#define DEVPTS_DOMAIN'
-          if devpts in text and 'susfs_set_sid' not in text:
-              idx = text.find(devpts)
-              funcs = "\n".join([
+          if marker not in text:
+              print("[SKIP] marker not found")
+              exit(0)
+          idx = text.find(marker)
+          eol = text.find('\n', idx) + 1
+          v = "\n".join(["",
+              "#ifdef CONFIG_KSU_SUSFS",
+              '#define KERNEL_INIT_DOMAIN "u:r:init:s0"',
+              '#define KERNEL_ZYGOTE_DOMAIN "u:r:zygote:s0"',
+              "u32 susfs_ksu_sid = 0;",
+              "u32 susfs_init_sid = 0;",
+              "u32 susfs_zygote_sid = 0;",
+              "#endif", ""])
+          text = text[:eol] + v + text[eol:]
+          if devpts in text:
+              idx2 = text.find(devpts)
+              f = "\n".join(["",
                   "#ifdef CONFIG_KSU_SUSFS",
-                  "static inline void susfs_set_sid(const char *secctx_name, u32 *out_sid)",
-                  "{",
-                  "\tint err;",
-                  "\tif (!secctx_name || !out_sid) {",
-                  '\t\tpr_err("secctx_name || out_sid is NULL\\n");',
-                  "\t\treturn;",
-                  "\t}",
-                  "\terr = security_secctx_to_secid(secctx_name, strlen(secctx_name), out_sid);",
-                  "\tif (err) {",
-                  '\t\tpr_err("failed setting sid err: %d\\n", err);',
-                  "\t\treturn;",
-                  "\t}",
-                  "}",
-                  "",
+                  "static inline void susfs_set_sid(const char *n, u32 *o)",
+                  "{ int e; if(!n||!o)return;",
+                  "  e=security_secctx_to_secid(n,strlen(n),o); if(e)return; }",
                   "bool susfs_is_sid_equal(void *sec, u32 sid2) {",
-                  "\tstruct task_security_struct *tsec = (struct task_security_struct *)sec;",
-                  "\tif (!tsec) return false;",
-                  "\treturn tsec->sid == sid2;",
-                  "}",
-                  "",
-                  "u32 susfs_get_sid_from_name(const char *secctx_name)",
-                  "{",
-                  "\tu32 out_sid = 0;",
-                  "\tint err;",
-                  "\tif (!secctx_name) return 0;",
-                  "\terr = security_secctx_to_secid(secctx_name, strlen(secctx_name), &out_sid);",
-                  "\tif (err) return 0;",
-                  "\treturn out_sid;",
-                  "}",
-                  "",
-                  "u32 susfs_get_current_sid(void) {",
-                  "\treturn current_sid();",
-                  "}",
-                  "",
-                  "void susfs_set_zygote_sid(void) {",
-                  "\tsusfs_set_sid(KERNEL_ZYGOTE_DOMAIN, &susfs_zygote_sid);",
-                  "}",
-                  "",
-                  "bool susfs_is_current_zygote_domain(void) {",
-                  "\treturn unlikely(current_sid() == susfs_zygote_sid);",
-                  "}",
-                  "",
-                  "void susfs_set_ksu_sid(void) {",
-                  "\tsusfs_set_sid(KERNEL_SU_DOMAIN, &susfs_ksu_sid);",
-                  "}",
-                  "",
-                  "bool susfs_is_current_ksu_domain(void) {",
-                  "\treturn unlikely(current_sid() == susfs_ksu_sid);",
-                  "}",
-                  "",
-                  "void susfs_set_init_sid(void) {",
-                  "\tsusfs_set_sid(KERNEL_INIT_DOMAIN, &susfs_init_sid);",
-                  "}",
-                  "",
-                  "bool susfs_is_current_init_domain(void) {",
-                  "\treturn unlikely(current_sid() == susfs_init_sid);",
-                  "}",
-                  "#endif",
-                  "",
-                  "",
-              ])
-              text = text[:idx] + funcs + text[idx:]
-
+                  "  struct task_security_struct *t=(struct task_security_struct*)sec;",
+                  "  if(!t)return false; return t->sid==sid2; }",
+                  "u32 susfs_get_sid_from_name(const char *n) {",
+                  "  u32 o=0; int e; if(!n)return 0;",
+                  "  e=security_secctx_to_secid(n,strlen(n),&o); if(e)return 0; return o; }",
+                  "u32 susfs_get_current_sid(void) { return current_sid(); }",
+                  "void susfs_set_zygote_sid(void) { susfs_set_sid(KERNEL_ZYGOTE_DOMAIN,&susfs_zygote_sid); }",
+                  "bool susfs_is_current_zygote_domain(void) { return unlikely(current_sid()==susfs_zygote_sid); }",
+                  "void susfs_set_ksu_sid(void) { susfs_set_sid(KERNEL_SU_DOMAIN,&susfs_ksu_sid); }",
+                  "bool susfs_is_current_ksu_domain(void) { return unlikely(current_sid()==susfs_ksu_sid); }",
+                  "void susfs_set_init_sid(void) { susfs_set_sid(KERNEL_INIT_DOMAIN,&susfs_init_sid); }",
+                  "bool susfs_is_current_init_domain(void) { return unlikely(current_sid()==susfs_init_sid); }",
+                  "#endif", "", ""])
+              text = text[:idx2] + f + text[idx2:]
           p.write_text(text)
-          print("[OK] selinux.c: clean SUSFS injected")
+          print("[OK] selinux.c")
           PYEOF
           fi
 
           echo ""
           echo "== Fix 3: rules.c =="
           if [ -f "$RULES_C" ] && ! grep -q "susfs_set_init_sid" "$RULES_C"; then
-            # Reset rules.c juga (karena patch 10 partially corrupted)
-            cd "$KSU_DIR"
-            git checkout -- kernel/selinux/rules.c 2>/dev/null || true
-            cd ..
-            echo "[OK] rules.c reset ke original"
-            
             python3 - "$RULES_C" << 'PYEOF'
           import sys
           from pathlib import Path
           p = Path(sys.argv[1])
           if not p.exists(): exit(0)
           lines = p.read_text().split('\n')
-          inserted = False
           new_lines = []
+          done = False
           for i, line in enumerate(lines):
-              if not inserted and 'rcu_read_unlock()' in line.strip():
-                  context = '\n'.join(lines[max(0,i-30):i])
-                  if 'ksu_apply_kernelsu_rules' in context or 'apply_kernelsu_rules' in context:
-                      new_lines.extend([
-                          '',
+              if not done and 'rcu_read_unlock()' in line.strip():
+                  ctx = '\n'.join(lines[max(0,i-30):i])
+                  if 'apply_kernelsu_rules' in ctx:
+                      new_lines.extend(['',
                           '#ifdef CONFIG_KSU_SUSFS',
-                          '\tk
+                          '\tksu_allow(db, "zygote", "labeledfs", "filesystem", "unmount");',
+                          '\tsusfs_set_init_sid();',
+                          '\tsusfs_set_ksu_sid();',
+                          '\tsusfs_set_zygote_sid();',
+                          '#endif', ''])
+                      done = True
+                      print("[OK] rules.c")
+              new_lines.append(line)
+          p.write_text('\n'.join(new_lines))
+          PYEOF
+          fi
+
+          echo ""
+          echo "== Verify =="
+          for f in "$SELINUX_H" "$SELINUX_C" "$RULES_C"; do
+            echo "  $(basename $f): $(grep -c susfs $f 2>/dev/null || echo 0) refs"
+          done
 
       - name: Prepare defconfig
         run: |
