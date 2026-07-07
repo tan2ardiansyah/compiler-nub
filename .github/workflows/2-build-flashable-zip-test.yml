@@ -196,21 +196,22 @@ jobs:
         env:
           KERNEL_STRING_ENV: ${{ github.event.inputs.kernel_string }}
 
-      - name: Tampilkan anykernel.sh final & masukkan Image.gz-dtb
+      - name: Prepare folder AnyKernel3 (siap zip oleh GitHub)
         run: |
-          cd ak3-build
-          echo "== Isi anykernel.sh final =="
-          cat anykernel.sh
+          cp Image.gz-dtb ak3-build/
 
-          cp ../Image.gz-dtb .
+          # Set nama artifact (tanpa .zip di akhir, GitHub yang tambah otomatis)
+          ARTIFACT_NAME="${{ github.event.inputs.zip_name }}-$(date -u +%Y%m%d-%H%M)"
+          echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> "$GITHUB_ENV"
 
-          ZIP_FILENAME="${{ github.event.inputs.zip_name }}-$(date -u +%Y%m%d).zip"
-          echo "ZIP_FILENAME=$ZIP_FILENAME" >> "$GITHUB_ENV"
-
-          zip -r9 "../$ZIP_FILENAME" . -x '.git/*' -x '.git' -x '.github/*' -x '.github' -x 'README.md' -x '*placeholder*'
-          cd ..
-          echo "== Isi zip yang dihasilkan =="
-          unzip -l "$ZIP_FILENAME"
+          echo "== Isi ak3-build (siap jadi flashable ZIP) =="
+          ls -la ak3-build/
+          echo ""
+          echo "== Struktur folder =="
+          find ak3-build/ -maxdepth 2 -type f | head -20
+          echo ""
+          echo "Artifact name yang akan diupload: $ARTIFACT_NAME"
+          echo "Setelah download dari GitHub, file akan bernama: ${ARTIFACT_NAME}.zip"
 
       - name: Generate Changelog Otomatis
         run: |
@@ -277,11 +278,12 @@ jobs:
 
           cat CHANGELOG.md
 
-      - name: Upload Flashable ZIP
+      - name: Upload Flashable ZIP (auto-zip GitHub)
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.ZIP_FILENAME }}
-          path: ${{ env.ZIP_FILENAME }}
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ak3-build/**
+          retention-days: 30
           if-no-files-found: error
 
       - name: Upload Changelog
