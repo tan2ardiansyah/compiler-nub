@@ -1,4 +1,4 @@
-name: 1. Compile Kernel - BOS Beryllium + KSU-Next + SUSFS v2.2.0
+name: 13. Compile Kernel - BOS Beryllium + KSU-Next + SUSFS v2.2.0
 
 on:
   workflow_dispatch:
