@@ -549,7 +549,7 @@ jobs:
           add_include fs/read_write.c
           if ! grep -q "ksu_handle_sys_read" fs/read_write.c; then
             inject_hook fs/read_write.c "SYSCALL_DEFINE3.read" \
-              "ksu_handle_sys_read(fd, &buf, &count);"
+              "ksu_handle_sys_read(fd);"
           fi
 
           # 5. setresuid
