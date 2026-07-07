@@ -286,6 +286,217 @@ jobs:
           PYEOF
           fi
 
+      - name: Fix SELinux SUSFS (patch 10 gagal di KSU-Next)
+        run: |
+          cd kernel-src
+          KSU_DIR="${{ env.KSU_DIR }}"
+          SELINUX_H="$KSU_DIR/kernel/selinux/selinux.h"
+          SELINUX_C="$KSU_DIR/kernel/selinux/selinux.c"
+          RULES_C="$KSU_DIR/kernel/selinux/rules.c"
+
+          echo "== Fix 1: selinux.h =="
+          if [ -f "$SELINUX_H" ] && ! grep -q "susfs_set_init_sid" "$SELINUX_H"; then
+            python3 << PYEOF
+          from pathlib import Path
+          import os
+          ksu = os.environ.get("KSU_DIR", "KernelSU-Next")
+          p = Path(f"{ksu}/kernel/selinux/selinux.h")
+          if not p.exists():
+              exit(0)
+          lines = p.read_text().split('\n')
+          idx = len(lines) - 1
+          for i, line in enumerate(lines):
+              if 'ksu_apply_kernelsu_rules' in line or 'apply_kernelsu_rules' in line:
+                  idx = i + 1
+                  break
+          decl = [
+              '',
+              '#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT',
+              'bool susfs_is_sid_equal(void *sec, u32 sid2);',
+              'u32 susfs_get_sid_from_name(const char *secctx_name);',
+              'u32 susfs_get_current_sid(void);',
+              'void susfs_set_zygote_sid(void);',
+              'bool susfs_is_current_zygote_domain(void);',
+              'void susfs_set_ksu_sid(void);',
+              'bool susfs_is_current_ksu_domain(void);',
+              'void susfs_set_init_sid(void);',
+              'bool susfs_is_current_init_domain(void);',
+              '#endif',
+              '',
+          ]
+          lines[idx:idx] = decl
+          p.write_text('\n'.join(lines))
+          print("[OK] selinux.h fixed")
+          PYEOF
+          fi
+
+          echo ""
+          echo "== Fix 2: selinux.c =="
+          if [ -f "$SELINUX_C" ] && ! grep -q "susfs_ksu_sid" "$SELINUX_C"; then
+            python3 << PYEOF
+          import re
+          from pathlib import Path
+          import os
+          ksu = os.environ.get("KSU_DIR", "KernelSU-Next")
+          p = Path(f"{ksu}/kernel/selinux/selinux.c")
+          if not p.exists():
+              exit(0)
+          text = p.read_text()
+
+          # Hapus broken SUSFS injections dari failed patch
+          broken = [
+              'susfs_is_sid_equal', 'susfs_get_current_sid',
+              'susfs_is_current_zygote_domain', 'susfs_is_current_ksu_domain',
+              'susfs_is_current_init_domain', 'susfs_set_sid',
+              'susfs_set_zygote_sid', 'susfs_set_ksu_sid', 'susfs_set_init_sid',
+              'susfs_get_sid_from_name',
+          ]
+          for func in broken:
+              text = re.sub(
+                  rf'(?:bool|void|u32|static inline void)\s+{func}\s*\([^)]*\)\s*\{{[^}}]*\}}',
+                  '', text, flags=re.DOTALL
+              )
+          text = re.sub(r'#ifdef CONFIG_KSU_SUSFS\s*\n(?:.*?\n)*?#endif\s*\n', '', text, count=1)
+
+          # Inject variables setelah KERNEL_SU_DOMAIN
+          marker = '#define KERNEL_SU_DOMAIN'
+          if marker in text:
+              idx = text.find(marker)
+              eol = text.find('\n', idx) + 1
+              text = text[:eol] + '''
+#ifdef CONFIG_KSU_SUSFS
+#define KERNEL_INIT_DOMAIN "u:r:init:s0"
+#define KERNEL_ZYGOTE_DOMAIN "u:r:zygote:s0"
+u32 susfs_ksu_sid = 0;
+u32 susfs_init_sid = 0;
+u32 susfs_zygote_sid = 0;
+#endif
+
+''' + text[eol:]
+
+          # Inject functions sebelum DEVPTS_DOMAIN
+          devpts = '#define DEVPTS_DOMAIN'
+          if devpts in text:
+              idx = text.find(devpts)
+              text = text[:idx] + '''#ifdef CONFIG_KSU_SUSFS
+static inline void susfs_set_sid(const char *secctx_name, u32 *out_sid)
+{
+\tint err;
+\tif (!secctx_name || !out_sid) {
+\t\tpr_err("secctx_name || out_sid is NULL\\n");
+\t\treturn;
+\t}
+\terr = security_secctx_to_secid(secctx_name, strlen(secctx_name), out_sid);
+\tif (err) {
+\t\tpr_err("failed setting sid for '%s', err: %d\\n", secctx_name, err);
+\t\treturn;
+\t}
+\tpr_info("sid '%u' is set for secctx_name '%s'\\n", *out_sid, secctx_name);
+}
+
+bool susfs_is_sid_equal(void *sec, u32 sid2) {
+\tstruct task_security_struct *tsec = (struct task_security_struct *)sec;
+\tif (!tsec) return false;
+\treturn tsec->sid == sid2;
+}
+
+u32 susfs_get_sid_from_name(const char *secctx_name)
+{
+\tu32 out_sid = 0;
+\tint err;
+\tif (!secctx_name) {
+\t\tpr_err("secctx_name is NULL\\n");
+\t\treturn 0;
+\t}
+\terr = security_secctx_to_secid(secctx_name, strlen(secctx_name), &out_sid);
+\tif (err) {
+\t\tpr_err("failed getting sid from secctx_name: %s, err: %d\\n", secctx_name, err);
+\t\treturn 0;
+\t}
+\treturn out_sid;
+}
+
+u32 susfs_get_current_sid(void) {
+\treturn current_sid();
+}
+
+void susfs_set_zygote_sid(void) {
+\tsusfs_set_sid(KERNEL_ZYGOTE_DOMAIN, &susfs_zygote_sid);
+}
+
+bool susfs_is_current_zygote_domain(void) {
+\treturn unlikely(current_sid() == susfs_zygote_sid);
+}
+
+void susfs_set_ksu_sid(void) {
+\tsusfs_set_sid(KERNEL_SU_DOMAIN, &susfs_ksu_sid);
+}
+
+bool susfs_is_current_ksu_domain(void) {
+\treturn unlikely(current_sid() == susfs_ksu_sid);
+}
+
+void susfs_set_init_sid(void) {
+\tsusfs_set_sid(KERNEL_INIT_DOMAIN, &susfs_init_sid);
+}
+
+bool susfs_is_current_init_domain(void) {
+\treturn unlikely(current_sid() == susfs_init_sid);
+}
+#endif
+
+''' + text[idx:]
+
+          text = re.sub(r'\\n{4,}', '\\n\\n\\n', text)
+          p.write_text(text)
+          print("[OK] selinux.c fixed")
+          PYEOF
+          fi
+
+          echo ""
+          echo "== Fix 3: rules.c =="
+          if [ -f "$RULES_C" ] && ! grep -q "susfs_set_init_sid" "$RULES_C"; then
+            python3 << PYEOF
+          from pathlib import Path
+          import os
+          ksu = os.environ.get("KSU_DIR", "KernelSU-Next")
+          p = Path(f"{ksu}/kernel/selinux/rules.c")
+          if not p.exists():
+              exit(0)
+          lines = p.read_text().split('\n')
+          inserted = False
+          new_lines = []
+          for i, line in enumerate(lines):
+              if not inserted and 'rcu_read_unlock()' in line.strip():
+                  context = '\n'.join(lines[max(0,i-30):i])
+                  if 'ksu_apply_kernelsu_rules' in context or 'apply_kernelsu_rules' in context:
+                      new_lines.extend([
+                          '',
+                          '#ifdef CONFIG_KSU_SUSFS',
+                          '\tksu_allow(db, "zygote", "labeledfs", "filesystem", "unmount");',
+                          '\tsusfs_set_init_sid();',
+                          '\tsusfs_set_ksu_sid();',
+                          '\tsusfs_set_zygote_sid();',
+                          '#endif',
+                          '',
+                      ])
+                      inserted = True
+                      print("[OK] rules.c: SUSFS calls injected")
+              new_lines.append(line)
+          if not inserted:
+              print("[WARN] injection point not found")
+          p.write_text('\n'.join(new_lines))
+          PYEOF
+          fi
+
+          echo ""
+          echo "== Verify =="
+          for f in "$SELINUX_H" "$SELINUX_C" "$RULES_C"; do
+            name=$(basename "$f")
+            count=$(grep -c "susfs" "$f" 2>/dev/null || echo 0)
+            echo "  $name: $count susfs references"
+          done
+
       - name: Prepare defconfig
         run: |
           cd kernel-src
